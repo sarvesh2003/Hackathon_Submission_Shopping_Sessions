@@ -89,8 +89,9 @@ const fn build_decode() -> [u8; 64] {
 }
 static DECODE: [u8; 64] = build_decode();
 
-#[inline]
-fn pack(id: &[u8]) -> Option<u64> {
+/// Reference version of `pack` (kept for the equivalence test).
+#[cfg(test)]
+fn pack_scalar(id: &[u8]) -> Option<u64> {
     if id.is_empty() || id.len() > MAX_PACK {
         return None;
     }
@@ -105,6 +106,34 @@ fn pack(id: &[u8]) -> Option<u64> {
         return None;
     }
     Some(k << (6 * (MAX_PACK - id.len()) as u32))
+}
+
+/// Same result as `pack_scalar`: a fixed, fully unrolled 10-step loop with no data-dependent
+/// exit (ID lengths vary, so a length-controlled loop mispredicts its exit), bytes past the end
+/// count as padding (code 0) without being invalid.
+#[inline(always)]
+fn pack(id: &[u8]) -> Option<u64> {
+    let n = id.len();
+    if n.wrapping_sub(1) >= MAX_PACK {
+        return None; // empty or longer than 10
+    }
+    let mut k = 0u64;
+    let mut bad = 0u8;
+    let mut i = 0;
+    while i < MAX_PACK {
+        let inside = i < n;
+        // SAFETY: the index is read only when i < n = id.len()
+        let b = if inside { unsafe { *id.get_unchecked(i) } } else { 0 };
+        let c = CODE[b as usize];
+        bad |= (inside & (c == 0)) as u8;
+        k = (k << 6) | c as u64;
+        i += 1;
+    }
+    if bad != 0 {
+        None
+    } else {
+        Some(k)
+    }
 }
 
 struct Interner {
@@ -2276,6 +2305,26 @@ mod tests {
             let mut got71 = Vec::new();
             for_each_record::<7>(&chunk7, |f| got71.push(f.iter().map(|v| v.to_vec()).collect::<Vec<_>>()));
             assert_eq!(got71, want7, "v1/7 round {round}: {:?}", String::from_utf8_lossy(&chunk7));
+        }
+    }
+
+
+    #[test]
+    fn pack_matches_scalar() {
+        let mut rng: u64 = 0x2545_f491_4f6c_dd1d;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let alphabet: &[u8] = b"0189AZaz_ \t\"\x00\xff-/:@[`{";
+        for _ in 0..2_000_000 {
+            let n = (next() % 13) as usize;
+            let v: Vec<u8> = (0..n)
+                .map(|_| if next() % 4 == 0 { alphabet[(next() as usize) % alphabet.len()] } else { b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"[(next() % 63) as usize] })
+                .collect();
+            assert_eq!(pack(&v), pack_scalar(&v), "{:?}", v);
         }
     }
 

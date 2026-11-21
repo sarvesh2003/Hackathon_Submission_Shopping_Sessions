@@ -1418,6 +1418,15 @@ fn run() -> Res<()> {
     });
     let pmap = gate.wait();
     stage!(t0, "parsed events + clicks");
+    // Nothing references the input files any more (records hold packed keys; odd IDs were
+    // copied into the interner). Unmap them on a background thread now, overlapped with the
+    // rest of the run, instead of during the single-threaded teardown after exit: this cut
+    // the time between our last write and process exit from ~160 ms to ~60 ms locally.
+    drop(event_chunks);
+    drop(click_chunks);
+    drop(link_chunks);
+    let maps = (event_maps, click_maps, link_maps);
+    std::thread::spawn(move || drop(maps));
 
     // ---- dedup events per event_id partition, scatter survivors by person
     let next = AtomicUsize::new(0);

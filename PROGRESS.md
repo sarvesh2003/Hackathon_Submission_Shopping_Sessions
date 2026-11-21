@@ -2,7 +2,7 @@
 
 Claude updates this after every milestone. The human reads it to see where things stand.
 
-Last updated: Sat Nov 21, 4:15 PM ET
+Last updated: Sat Nov 21, evening ET
 
 ## Status
 | Milestone | State | Notes |
@@ -38,6 +38,8 @@ shopping image (037bec2): fixtures 36/36 | dev: MATCH | check20: identical | cro
 | 71874c0 | + review fixes: buffer sizing, purchase-only category, date cache, single-person bucket sort | 1.13-1.57 s | | minflt ~32k (was ~250k) |
 | 037bec2 | + no zero-fill counting sort, biggest partitions first, SWAR F3 | ~same as 71874c0 | | neutral locally; less work at 60M |
 | 15e88b3+ | + alive-bitset dedup, fat LTO | ~1.20 s | | dedup stage ~190 ms (was 290-470) |
+| 2133c20 | + line-at-a-time splitter (20 vs 40 ns/line) | ~1.2 s | | leaderboard 1.12 s |
+| next | + unmap inputs on a background thread after parsing | wall ~1.34 -> ~1.21 s | | measured OUTSIDE the process: time from our last write to process exit fell from ~160 ms to ~60 ms (kernel teardown of the 1.9 GB of file mappings) |
 | f60m | shopping 4342a0e, 60M | 14.7 s (first run 29 s) | 6.0 GB RSS | laptop swapping; far under the 3-minute cap |
 
 ## Tried and rejected (measured, not faster here)
@@ -45,12 +47,16 @@ shopping image (037bec2): fixtures 36/36 | dev: MATCH | check20: identical | cro
 - Person lookup fused into dedup via one global table with batched prefetch (both reviews suggested it): dedup+lookup ~500 ms vs ~255 ms for the partitioned join.
 - Union-find before parsing on all threads: +260 ms on the critical path; overlapping it on worker 0 is better. Union-find without rayon: too slow, delays the parse stage.
 - Freeing the big buffers before writing Parquet: doubles page faults.
-- Bitmap filter in front of the person map; mimalloc purge/large-page options; MAP_POPULATE.
+- Bitmap filter in front of the person map; mimalloc purge/large-page options (MIMALLOC_ALLOW_LARGE_OS_PAGES=1: no change in faults); MAP_POPULATE.
+- Freeing dead intermediate buffers on background threads: no gain (exit gap not reduced).
+
+## Measuring note
+- Stage timers stop at our last write; the scorer clock runs until the process (container) exits. Measure wall time outside the process: the gap was ~160 ms (now ~60 ms).
 
 ## Submissions
 | Time (ET) | Commit | Leaderboard result | Notes |
 | --- | --- | --- | --- |
-| ? | ? | ? | Human submits; results not reported back yet. Top of the board: 0.3 s. |
+| Sat evening | 2133c20 | 1.12 s | practice leaderboard; #1 is 0.29 s |
 
 ## Open questions and blockers
 - Leaderboard score of our submissions (needed to know the real gap to 0.3 s).

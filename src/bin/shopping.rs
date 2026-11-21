@@ -240,6 +240,7 @@ fn special_mask(p: &[u8; 64]) -> u64 {
 /// only; a field is either free of quotes or wrapped in exactly one pair of quotes, which are
 /// removed). Malformed and empty lines are skipped. Same semantics as `split_fields`.
 #[inline(always)]
+#[allow(unused_assignments)]
 fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
     let len = chunk.len();
     let mut fields: [&'a [u8]; N] = [&[]; N];
@@ -1130,6 +1131,11 @@ fn run() -> Res<()> {
         return Ok(());
     }
 
+    if std::env::var_os("SS_MICRO").is_some() {
+        micro(&event_chunks, &ctx);
+        return Ok(());
+    }
+
     // ---- links (parallel parse)
     let link_pairs = parse_links(&link_chunks);
     stage!(t0, "parsed links");
@@ -1156,31 +1162,18 @@ fn run() -> Res<()> {
                         cl: (0..NPART).map(|_| Vec::with_capacity(cl_est)).collect(),
                     };
                     let mut pmap: Option<Arc<PersonMap>> = None;
-                    let exp: u32 = std::env::var("SS_EXP").ok().and_then(|v| v.parse().ok()).unwrap_or(0);
-                    let mut dummy = 0usize;
                     loop {
                         let i = next.fetch_add(1, AtOrd::Relaxed);
                         if i >= n_all {
                             break;
                         }
                         if i < n_ev {
-                            match exp {
-                                1 => for_each_record::<7>(event_chunks[i], |f| {
-                                    dummy += f[0].len();
-                                }),
-                                2 => for_each_record::<7>(event_chunks[i], |f| {
-                                    if !f[0].is_empty() {
-                                        let r = parse_event(f, ctx);
-                                        dummy += r.ts as usize + r.eid as usize;
-                                    }
-                                }),
-                                _ => for_each_record::<7>(event_chunks[i], |f| {
-                                    if !f[0].is_empty() {
-                                        let r = parse_event(f, ctx);
-                                        out.ev[part_of(r.eid)].push(r);
-                                    }
-                                }),
-                            }
+                            for_each_record::<7>(event_chunks[i], |f| {
+                                if !f[0].is_empty() {
+                                    let r = parse_event(f, ctx);
+                                    out.ev[part_of(r.eid)].push(r);
+                                }
+                            });
                         } else {
                             let pm = pmap.get_or_insert_with(|| gate.wait()).clone();
                             for_each_record::<4>(click_chunks[i - n_ev], |f| {
@@ -1190,9 +1183,6 @@ fn run() -> Res<()> {
                                 }
                             });
                         }
-                    }
-                    if dummy == 1 {
-                        eprintln!("dummy");
                     }
                     out
                 })
@@ -1215,7 +1205,6 @@ fn run() -> Res<()> {
                     let mut parts: Vec<Vec<PEv>> =
                         (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
                     let mut recs: Vec<EvRec> = Vec::new();
-                    let nolookup = std::env::var_os("SS_NOLOOKUP").is_some();
                     let mut table: Vec<u32> = Vec::new();
                     loop {
                         let p = next.fetch_add(1, AtOrd::Relaxed);
@@ -1257,7 +1246,7 @@ fn run() -> Res<()> {
                             if s != u32::MAX {
                                 let r = &recs[s as usize];
                                 if r.user != INVALID {
-                                    let person = if nolookup { r.user } else { pmap.person(r.user) };
+                                    let person = pmap.person(r.user);
                                     parts[part_of(person)].push(PEv { person, ts: r.ts, pc: r.pc });
                                 }
                             }
@@ -1269,7 +1258,10 @@ fn run() -> Res<()> {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let cl_outs: Vec<Vec<Vec<PCl>>> = outs.into_iter().map(|o| o.cl).collect();
+    let cl_outs: Vec<Vec<Vec<PCl>>> = outs
+        .into_iter()
+        .map(|o| o.cl)
+        .collect();
     stage!(t0, "dedup events");
 
     // ---- per person partition: sessions, credit, assists
@@ -1429,7 +1421,90 @@ fn run() -> Res<()> {
     r1?;
     r2?;
     stage!(t0, "written");
-    Ok(())
+    // all files are closed; exit without freeing the heap
+    std::process::exit(0)
+}
+
+/// Single-threaded component timings on ~300 MB of events held in memory (measurement only).
+#[inline(never)]
+fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
+    let mut data: Vec<u8> = Vec::new();
+    for c in event_chunks {
+        if data.len() > 300 << 20 {
+            break;
+        }
+        data.extend_from_slice(c);
+    }
+    let mb = data.len() as f64 / 1e6;
+    let lines = memchr::memchr_iter(b'\n', &data).count();
+    let run = |name: &str, f: &mut dyn FnMut() -> usize| {
+        let mut best = f64::MAX;
+        let mut x = 0;
+        for _ in 0..3 {
+            let t = Instant::now();
+            x = f();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        eprintln!(
+            "micro: {:>7.1} ms  {:>6.1} ns/line  {:>6.0} MB/s  {}  [{}]",
+            best * 1e3,
+            best * 1e9 / lines as f64,
+            mb / best,
+            name,
+            x
+        );
+    };
+    run("memchr newlines", &mut || memchr::memchr_iter(b'\n', &data).count());
+    run("split 7 fields", &mut || {
+        let mut n = 0;
+        for_each_record::<7>(&data, |f| n += f[0].len());
+        n
+    });
+    run("+ pack eid", &mut || {
+        let mut n = 0u64;
+        for_each_record::<7>(&data, |f| n = n.wrapping_add(id_key(f[0])));
+        n as usize
+    });
+    run("+ parse ts", &mut || {
+        let mut n = 0i64;
+        for_each_record::<7>(&data, |f| n = n.wrapping_add(parse_ts(f[2]).unwrap_or(0)));
+        n as usize
+    });
+    run("+ parse ingest", &mut || {
+        let mut n = 0i64;
+        for_each_record::<7>(&data, |f| n = n.wrapping_add(parse_ts(f[3]).unwrap_or(0)));
+        n as usize
+    });
+    run("+ pack user", &mut || {
+        let mut n = 0u64;
+        for_each_record::<7>(&data, |f| n = n.wrapping_add(id_key(f[1])));
+        n as usize
+    });
+    run("+ product category", &mut || {
+        let mut n = 0usize;
+        for_each_record::<7>(&data, |f| n += ctx.category(f[5]) as usize);
+        n
+    });
+    run("full parse_event", &mut || {
+        let mut n = 0u64;
+        for_each_record::<7>(&data, |f| {
+            if !f[0].is_empty() {
+                let r = parse_event(f, ctx);
+                n = n.wrapping_add(r.eid ^ r.user ^ r.pc as u64);
+            }
+        });
+        n as usize
+    });
+    run("parse_event + scatter 512", &mut || {
+        let mut parts: Vec<Vec<EvRec>> = (0..NPART).map(|_| Vec::with_capacity(lines / NPART + 64)).collect();
+        for_each_record::<7>(&data, |f| {
+            if !f[0].is_empty() {
+                let r = parse_event(f, ctx);
+                parts[part_of(r.eid)].push(r);
+            }
+        });
+        parts.iter().map(|p| p.len()).sum()
+    });
 }
 
 const UD_SCHEMA: &str = "message user_daily {

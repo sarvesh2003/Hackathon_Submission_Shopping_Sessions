@@ -2,7 +2,7 @@
 
 Claude updates this after every milestone. The human reads it to see where things stand.
 
-Last updated: Sat Nov 21, 11:45 AM ET
+Last updated: Sat Nov 21, 12:50 PM ET
 
 ## Status
 | Milestone | State | Notes |
@@ -10,11 +10,11 @@ Last updated: Sat Nov 21, 11:45 AM ET
 | M0 Setup | done | Repo lives in WSL at `~/shopping_sessions` (not /mnt/c), pushed to GitHub. Kit, dev, cross-check and p20m datasets generated. |
 | M1 Simple Rust reference (first submission) | gate passed except local bench20 time (see notes) | 36/36 fixtures (native and image), dev MATCH (native and image). 20M: 175 s natively on this laptop. |
 | M2 Fast version v1 | gate passed | Image BIN=shopping: fixtures 36/36, dev MATCH, check20 identical, crosscheck 12/12. 6.6 s on p20m in Docker. |
-| M3 Speed | not started | |
+| M3 Speed | in progress | AVX2 field scanner, per-thread partitions, hash dedup, parallel union-find densify. ~2 s native on p20m (from 5-5.7 s). |
 | M4 Final hardening | not started | |
 
 ## Machine
-CPU: Intel Core Ultra 5 225U (12 cores / 14 threads, laptop) | AVX-512: no (AVX2 yes) | docker NCPU: 14 | docker MemTotal: 10.4 GB (WSL capped at 10 GB; laptop has 15.5 GB) | free disk: 817 GB | clean build time: ? | Docker limits used: CPUS=8 MEM=8g
+CPU: Intel Core Ultra 5 225U (12 cores / 14 threads, laptop) | AVX-512: no (AVX2 yes) | docker NCPU: 14 | docker MemTotal: 10.4 GB (WSL capped at 10 GB; laptop has 15.5 GB) | free disk: 817 GB | clean build time: 86 s (builder cache pruned) | Docker limits used: CPUS=8 MEM=8g
 
 Notes on local timing:
 - On battery the CPU is about 3x slower (Windows parks WSL on efficiency cores). Only time on AC power.
@@ -31,13 +31,15 @@ shopping image: fixtures 36/36 | dev: MATCH | check20: identical | crosscheck: 1
 | bc75a66 | reference image, bench20 (CPUS=8 MEM=8g) | 123 s | under 8g | single run, output MATCH vs native reference |
 | M2 v1 | shopping v1 (native, warm cache) | 5.0-5.7 s | 4.1 GB | single runs; first cold run 14 s |
 | M2 v1 | shopping v1 image (check20 run) | 6.6 s | | single run |
+| M3a | shopping, NCPU=8 native | 1.9-2.3 s | ~2.5 GB | runs vary 20%; image 3.7-5.0 s (Docker Desktop bind mount is slow here) |
 
 ## Submissions
 | Time (ET) | Commit | Leaderboard result | Notes |
 | --- | --- | --- | --- |
 
 ## Open questions and blockers
-- none yet
+- Profiling needs: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid (asked the human).
+- Local Docker is much slower than native here (bind mount); use native NCPU=8 for speed comparisons, Docker for correctness.
 
 ## Next step
-- M3: profile and speed up event parsing, dedup and links.
+- M3: keep cutting parse cost (timestamps, IDs), dedup gather, person lookups; hand-written Parquet writer.

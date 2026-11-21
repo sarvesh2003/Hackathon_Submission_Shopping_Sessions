@@ -1495,14 +1495,18 @@ fn run() -> Res<()> {
     // reserved-but-untouched tail costs nothing, a doubling costs a copy and fresh page faults
     let cl_est = click_chunks.iter().map(|c| c.len()).sum::<usize>() / 40 / nthreads / NPART * 5 / 4 + 64;
     let est = event_chunks.iter().map(|c| c.len()).sum::<usize>() / 64 / nthreads / NPART * 5 / 4 + 64;
-    let outs: Vec<ParseOut> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|w| {
+    // union-find runs on worker 0 during parsing; its parallel parts get their own pool so they
+    // do not wait behind the parse workers, which occupy the global pool
+    let uf_pool = rayon::ThreadPoolBuilder::new().num_threads(nthreads).build()?;
+    let uf_pool = &uf_pool;
+    let outs: Vec<ParseOut> = rayon::broadcast(|bc| {
+        let w = bc.index();
+        {
                 let (gate, next, ctx, link_pairs) = (&gate, &next, &ctx, &link_pairs);
                 let (event_chunks, click_chunks) = (&event_chunks, &click_chunks);
-                s.spawn(move || {
+                (move || {
                     if w == 0 {
-                        gate.set(build_person_map(link_pairs));
+                        gate.set(uf_pool.install(|| build_person_map(link_pairs)));
                         stage!(t0, "union-find done");
                     }
                     let mut out = ParseOut {
@@ -1532,10 +1536,8 @@ fn run() -> Res<()> {
                         }
                     }
                     out
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })()
+        }
     });
     let pmap = gate.wait();
     stage!(t0, "parsed events + clicks");

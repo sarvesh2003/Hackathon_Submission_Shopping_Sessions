@@ -1241,10 +1241,10 @@ fn run() -> Res<()> {
     let next = AtomicUsize::new(0);
     let n_ev_recs: usize = outs.iter().map(|o| o.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
     let pe_est = n_ev_recs / nthreads / NPART * 9 / 8 + 16;
-    let pe_outs: Vec<Vec<Vec<PEv>>> = std::thread::scope(|s| {
+    let ue_outs: Vec<Vec<Vec<PEv>>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
-                let (next, outs, pmap) = (&next, &outs, &pmap);
+                let (next, outs) = (&next, &outs);
                 s.spawn(move || {
                     let mut parts: Vec<Vec<PEv>> =
                         (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
@@ -1290,8 +1290,8 @@ fn run() -> Res<()> {
                             if s != u32::MAX {
                                 let r = &recs[s as usize];
                                 if r.user != INVALID {
-                                    let person = pmap.person(r.user);
-                                    parts[part_of(person)].push(PEv { person, ts: r.ts, pc: r.pc });
+                                    // person resolved in the next pass (partitioned join)
+                                    parts[part_of(r.user)].push(PEv { person: r.user, ts: r.ts, pc: r.pc });
                                 }
                             }
                         }
@@ -1307,6 +1307,37 @@ fn run() -> Res<()> {
         .map(|o| o.cl)
         .collect();
     stage!(t0, "dedup events");
+
+    // ---- resolve persons: user partition q only needs the small map pmap.parts[q]
+    let next = AtomicUsize::new(0);
+    let pe_outs: Vec<Vec<Vec<PEv>>> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..nthreads)
+            .map(|_| {
+                let (next, ue_outs, pmap) = (&next, &ue_outs, &pmap);
+                s.spawn(move || {
+                    let mut parts: Vec<Vec<PEv>> =
+                        (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
+                    loop {
+                        let q = next.fetch_add(1, AtOrd::Relaxed);
+                        if q >= NPART {
+                            break;
+                        }
+                        let m = &pmap.parts[q];
+                        for o in ue_outs.iter() {
+                            for e in &o[q] {
+                                let person = m.get(&e.person).copied().unwrap_or(e.person);
+                                parts[part_of(person)].push(PEv { person, ts: e.ts, pc: e.pc });
+                            }
+                        }
+                    }
+                    parts
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    drop(ue_outs);
+    stage!(t0, "resolved persons");
 
     // ---- per person partition: sessions, credit, assists
     let ncat = cat_names.len();

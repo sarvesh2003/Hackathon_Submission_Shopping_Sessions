@@ -1428,11 +1428,22 @@ fn run() -> Res<()> {
                                 continue;
                             }
                             if es.len() > 1 {
-                                es.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
+                                // usually one person per bucket: then the timestamp alone orders it
+                                let p0 = es[0].person;
+                                if es.iter().all(|e| e.person == p0) {
+                                    es.sort_unstable_by_key(|e| e.ts);
+                                } else {
+                                    es.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
+                                }
                             }
                             let cs = &mut cls2[coff[b] as usize..coff[b + 1] as usize];
                             if cs.len() > 1 {
-                                cs.sort_unstable_by_key(|c| ((c.person as u128) << 32) | c.ts as u128);
+                                let p0 = cs[0].person;
+                                if cs.iter().all(|c| c.person == p0) {
+                                    cs.sort_unstable_by_key(|c| c.ts);
+                                } else {
+                                    cs.sort_unstable_by_key(|c| ((c.person as u128) << 32) | c.ts as u128);
+                                }
                             }
                             let (es, cs) = (&*es, &*cs);
                             let mut ci = 0usize;

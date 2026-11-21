@@ -9,7 +9,7 @@ Last updated: Sat Nov 21, 11:45 AM ET
 | --- | --- | --- |
 | M0 Setup | done | Repo lives in WSL at `~/shopping_sessions` (not /mnt/c), pushed to GitHub. Kit, dev, cross-check and p20m datasets generated. |
 | M1 Simple Rust reference (first submission) | gate passed except local bench20 time (see notes) | 36/36 fixtures (native and image), dev MATCH (native and image). 20M: 175 s natively on this laptop. |
-| M2 Fast version v1 | in progress | `src/bin/shopping.rs` already 36/36, dev MATCH, and identical to the reference on p20m (native run). |
+| M2 Fast version v1 | gate passed | Image BIN=shopping: fixtures 36/36, dev MATCH, check20 identical, crosscheck 12/12. 6.6 s on p20m in Docker. |
 | M3 Speed | not started | |
 | M4 Final hardening | not started | |
 
@@ -22,14 +22,15 @@ Notes on local timing:
 
 ## Correctness gate (latest run)
 reference: ref-fixtures 36/36, ref-dev MATCH, image fixtures 36/36, image dev MATCH
-shopping (native, not yet in the image): fixtures 36/36, dev MATCH, p20m identical to reference
+shopping image: fixtures 36/36 | dev: MATCH | check20: identical | crosscheck: 12/12 | check60: not yet
 
 ## Local timings (median of 3 on data/p20m; data/f60m where noted)
 | Commit | Change | Time | Peak memory | Notes |
 | --- | --- | --- | --- | --- |
 | bc75a66 | reference (native) | 175 s | 4.4 GB | single run, AC power |
 | bc75a66 | reference image, bench20 (CPUS=8 MEM=8g) | 123 s | under 8g | single run, output MATCH vs native reference |
-| (next) | shopping v1 (native, warm cache) | 5.7 s | 4.1 GB | single run; first cold run 14 s |
+| M2 v1 | shopping v1 (native, warm cache) | 5.0-5.7 s | 4.1 GB | single runs; first cold run 14 s |
+| M2 v1 | shopping v1 image (check20 run) | 6.6 s | | single run |
 
 ## Submissions
 | Time (ET) | Commit | Leaderboard result | Notes |
@@ -39,4 +40,4 @@ shopping (native, not yet in the image): fixtures 36/36, dev MATCH, p20m identic
 - none yet
 
 ## Next step
-- Submit the reference (M1), then put shopping into the image and run the M2 gate.
+- M3: profile and speed up event parsing, dedup and links.

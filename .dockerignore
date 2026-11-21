@@ -1,0 +1,10 @@
+.git
+target/
+kit/
+data/
+out/
+.venv/
+fixtures/
+reference/
+docs/
+*.md

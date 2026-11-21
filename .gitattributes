@@ -1,0 +1,3 @@
+# Never convert line endings: fixtures contain intentional \r bytes (fixture E20),
+# and shell scripts must keep LF on Windows/WSL checkouts.
+* -text

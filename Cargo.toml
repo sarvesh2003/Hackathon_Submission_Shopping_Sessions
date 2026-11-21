@@ -9,8 +9,17 @@ publish = false
 name = "reference"
 path = "src/bin/reference.rs"
 
+[[bin]]
+name = "shopping"
+path = "src/bin/shopping.rs"
+
 [dependencies]
 parquet = { version = "60.2.0", default-features = false }
+rayon = "1"
+memmap2 = "0.9"
+memchr = "2"
+hashbrown = "0.16"
+mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
 lto = "thin"

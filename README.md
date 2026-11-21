@@ -17,7 +17,8 @@ make bench20             # median of 3 timed runs on 20M events
 
 ## Third-party material
 - Official Buildathon starter material: `fixtures/`, `scripts/run_fixtures.py`, `scripts/compare.py`, `scripts/docker_run.sh`, `docs/rules.md`.
-- Rust crates: listed here as they are added (see `Cargo.toml`).
+- Rust crates (versions pinned in `Cargo.lock`): `parquet` (Apache Arrow Rust project, default features off, no `arrow`), `rayon`, `memmap2`, `memchr`, `hashbrown` (with its default `foldhash` hasher), `mimalloc`, and their transitive dependencies.
+- Docker base images: `rust:1.99-slim-bookworm` (build) and `debian:bookworm-slim` (runtime), pinned by digest.
 - Python (official test scripts only): polars, pyarrow.
 
 ## License

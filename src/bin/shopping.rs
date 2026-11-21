@@ -1962,6 +1962,19 @@ fn run() -> Res<()> {
     r2?;
     stage!(t0, "written");
     prof_dump();
+    if std::env::var_os("SS_TIMERS").is_some() {
+        // SAFETY: getrusage fills a plain struct
+        unsafe {
+            let mut ru: libc::rusage = std::mem::zeroed();
+            libc::getrusage(libc::RUSAGE_SELF, &mut ru);
+            eprintln!(
+                "shopping: rusage user {:.3} s, sys {:.3} s, minflt {}, majflt {}, maxrss {} MB, nvcsw {}, nivcsw {}",
+                ru.ru_utime.tv_sec as f64 + ru.ru_utime.tv_usec as f64 / 1e6,
+                ru.ru_stime.tv_sec as f64 + ru.ru_stime.tv_usec as f64 / 1e6,
+                ru.ru_minflt, ru.ru_majflt, ru.ru_maxrss / 1024, ru.ru_nvcsw, ru.ru_nivcsw
+            );
+        }
+    }
     // all files are closed; exit without freeing the heap
     std::process::exit(0)
 }

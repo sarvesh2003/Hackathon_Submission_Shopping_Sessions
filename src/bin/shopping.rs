@@ -918,20 +918,46 @@ struct PersonMap {
 
 
 fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
-    // dense indices: sorted unique keys
-    let mut keys: Vec<u64> = pairs.par_iter().flat_map_iter(|v| v.iter().flat_map(|&(a, b)| [a, b])).collect();
-    keys.par_sort_unstable();
-    keys.dedup();
-    let idx: Vec<Vec<(u32, u32)>> = pairs
+    let tt = Instant::now();
+    let tm = std::env::var_os("SS_TIMERS").is_some();
+    macro_rules! uft {
+        ($n:expr) => {
+            if tm {
+                eprintln!("uf: {:>7.1} ms  {}", tt.elapsed().as_secs_f64() * 1e3, $n);
+            }
+        };
+    }
+    // dense ids: sort (key, endpoint slot) pairs once, then number distinct keys in order;
+    // slot 2j / 2j+1 = the two sides of link j (in `pairs` order)
+    let mut offs = Vec::with_capacity(pairs.len());
+    let mut total = 0usize;
+    for v in pairs {
+        offs.push(total);
+        total += v.len();
+    }
+    let mut ends: Vec<(u64, u32)> = pairs
         .par_iter()
-        .map(|v| {
-            v.iter()
-                .map(|&(a, b)| {
-                    (keys.binary_search(&a).unwrap() as u32, keys.binary_search(&b).unwrap() as u32)
-                })
-                .collect()
+        .zip(offs.par_iter())
+        .flat_map_iter(|(v, &base)| {
+            v.iter().enumerate().flat_map(move |(j, &(a, b))| {
+                let s = ((base + j) * 2) as u32;
+                [(a, s), (b, s + 1)]
+            })
         })
         .collect();
+    uft!("collected endpoints");
+    ends.par_sort_unstable_by_key(|e| e.0);
+    uft!("sorted endpoints");
+    let mut keys: Vec<u64> = Vec::with_capacity(ends.len() / 2 + 1);
+    let mut ids: Vec<u32> = vec![0; ends.len()];
+    for &(k, slot) in &ends {
+        if keys.last() != Some(&k) {
+            keys.push(k);
+        }
+        ids[slot as usize] = (keys.len() - 1) as u32;
+    }
+    drop(ends);
+    uft!(format!("dense ids ({} keys)", keys.len()));
     let n = keys.len();
     let mut parent: Vec<u32> = (0..n as u32).collect();
     fn find(parent: &mut [u32], mut x: u32) -> u32 {
@@ -942,33 +968,39 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
         }
         x
     }
-    for v in &idx {
-        for &(a, b) in v {
-            let ra = find(&mut parent, a);
-            let rb = find(&mut parent, b);
-            if ra != rb {
+    // Every root is the byte-wise smallest key of its set: a union hangs the root with the
+    // larger key under the other. Ids follow sorted u64 key order, which is byte order when
+    // neither key is a fallback (interned) key.
+    let smaller = |a: u32, b: u32| -> bool {
+        let (ka, kb) = (keys[a as usize], keys[b as usize]);
+        if (ka | kb) & FALLBACK == 0 {
+            a < b
+        } else {
+            id_cmp(ka, kb) == std::cmp::Ordering::Less
+        }
+    };
+    for j in 0..total {
+        let ra = find(&mut parent, ids[2 * j]);
+        let rb = find(&mut parent, ids[2 * j + 1]);
+        if ra != rb {
+            if smaller(ra, rb) {
+                parent[rb as usize] = ra;
+            } else {
                 parent[ra as usize] = rb;
             }
         }
     }
-    // smallest ID per root (byte-wise; integer order for packed keys)
-    let mut best: Vec<u64> = vec![INVALID; n];
-    let mut roots: Vec<u32> = Vec::with_capacity(n);
-    for i in 0..n {
-        let r = find(&mut parent, i as u32) as usize;
-        roots.push(r as u32);
-        if best[r] == INVALID || id_cmp(keys[i], best[r]) == std::cmp::Ordering::Less {
-            best[r] = keys[i];
-        }
-    }
+    uft!("unions");
     // scatter (id, person) by partition, then build the small maps in parallel
     let mut by_part: Vec<Vec<(u64, u64)>> = new_parts();
-    for i in 0..n {
-        let b = best[roots[i] as usize];
-        if b != keys[i] {
-            by_part[part_of(keys[i])].push((keys[i], b)); // own-person IDs need no entry
+    for i in 0..n as u32 {
+        let r = find(&mut parent, i);
+        if r != i {
+            // own-person IDs (the roots) need no entry
+            by_part[part_of(keys[i as usize])].push((keys[i as usize], keys[r as usize]));
         }
     }
+    uft!("scattered");
     let parts = by_part
         .into_par_iter()
         .map(|v| {
@@ -977,6 +1009,7 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
             m
         })
         .collect();
+    uft!("maps built");
     PersonMap { parts }
 }
 

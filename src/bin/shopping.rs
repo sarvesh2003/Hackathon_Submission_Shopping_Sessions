@@ -25,6 +25,9 @@ use parquet::file::writer::SerializedFileWriter;
 use parquet::schema::parser::parse_message_type;
 use rayon::prelude::*;
 
+#[path = "../pq.rs"]
+mod pq;
+
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
@@ -1415,9 +1418,87 @@ fn run() -> Res<()> {
         )
     };
 
-    let (r1, r2) = rayon::join(cd_job, || {
-        workers.par_iter().enumerate().map(|(i, w)| ud_job(i, w)).collect::<Res<Vec<()>>>()
-    });
+    // hand-written writer (default); SS_PQ_CRATE=1 uses the parquet crate instead
+    let cd_job_hw = || -> Res<()> {
+        let (mut cname, mut cname_end) = (Vec::new(), Vec::new());
+        let (mut chan, mut chan_end) = (Vec::new(), Vec::new());
+        let (mut day, mut sess, mut purch, mut rev, mut asst) =
+            (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
+        for c in 0..=ctx.ncamp {
+            for d in 0..ndays {
+                let a = &camp_total[c * ndays + d];
+                if a.sessions == 0 && a.assisted == 0 {
+                    continue;
+                }
+                let (name, channel): (&[u8], &[u8]) =
+                    if c == ctx.ncamp { (b"organic", b"organic") } else { camp_names[c] };
+                cname.extend_from_slice(name);
+                cname_end.push(cname.len() as u32);
+                chan.extend_from_slice(channel);
+                chan_end.push(chan.len() as u32);
+                day.push((ws_day + d as i64) as i32);
+                sess.push(a.sessions as i64);
+                purch.push(a.purchasing as i64);
+                rev.push(a.revenue as i64);
+                asst.push(a.assisted as i64);
+            }
+        }
+        let cols = [
+            pq::Column::Str { name: "campaign_id", data: &cname, ends: &cname_end },
+            pq::Column::Str { name: "channel", data: &chan, ends: &chan_end },
+            pq::Column::Date { name: "day", values: &day },
+            pq::Column::I64 { name: "sessions", values: &sess },
+            pq::Column::I64 { name: "purchasing_sessions", values: &purch },
+            pq::Column::I64 { name: "revenue_cents", values: &rev },
+            pq::Column::I64 { name: "assisted_sessions", values: &asst },
+        ];
+        let mut f = fs::File::create(cd_dir.join("part-0.parquet"))?;
+        pq::write_file(&mut f, day.len(), &cols)?;
+        Ok(())
+    };
+    let ud_job_hw = |wi: usize, w: &Worker| -> Res<()> {
+        let n = w.rows.len();
+        let (mut user, mut user_end) = (Vec::with_capacity(n * 10), Vec::with_capacity(n));
+        let (mut top, mut top_end, mut present) = (Vec::new(), Vec::new(), Vec::with_capacity(n));
+        let (mut day, mut sess, mut evs, mut rev) =
+            (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
+        for r in &w.rows {
+            id_bytes(r.person, &mut user);
+            user_end.push(user.len() as u32);
+            day.push((ws_day + r.day as i64) as i32);
+            sess.push(r.sessions as i64);
+            evs.push(r.events as i64);
+            rev.push(r.revenue as i64);
+            if r.top >= 0 {
+                top.extend_from_slice(cat_names[r.top as usize]);
+                top_end.push(top.len() as u32);
+                present.push(true);
+            } else {
+                present.push(false);
+            }
+        }
+        let cols = [
+            pq::Column::Str { name: "user_id", data: &user, ends: &user_end },
+            pq::Column::Date { name: "day", values: &day },
+            pq::Column::I64 { name: "sessions", values: &sess },
+            pq::Column::I64 { name: "events", values: &evs },
+            pq::Column::I64 { name: "revenue_cents", values: &rev },
+            pq::Column::OptStr { name: "top_category", data: &top, ends: &top_end, present: &present },
+        ];
+        let mut f = fs::File::create(ud_dir.join(format!("part-{wi}.parquet")))?;
+        pq::write_file(&mut f, n, &cols)?;
+        Ok(())
+    };
+
+    let (r1, r2) = if std::env::var_os("SS_PQ_CRATE").is_some() {
+        rayon::join(cd_job, || {
+            workers.par_iter().enumerate().map(|(i, w)| ud_job(i, w)).collect::<Res<Vec<()>>>()
+        })
+    } else {
+        rayon::join(cd_job_hw, || {
+            workers.par_iter().enumerate().map(|(i, w)| ud_job_hw(i, w)).collect::<Res<Vec<()>>>()
+        })
+    };
     r1?;
     r2?;
     stage!(t0, "written");

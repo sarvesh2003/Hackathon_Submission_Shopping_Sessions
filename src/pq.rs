@@ -52,15 +52,15 @@ impl Thrift {
         self.varint(((v << 1) ^ (v >> 63)) as u64);
     }
     fn field(&mut self, id: i16, ty: u8) {
-        let last = self.last.last_mut().unwrap();
-        let delta = id - *last;
+        let last = *self.last.last().unwrap();
+        let delta = id - last;
         if delta > 0 && delta <= 15 {
             self.buf.push(((delta as u8) << 4) | ty);
         } else {
             self.buf.push(ty);
             self.zigzag(id as i64);
         }
-        *last = id;
+        *self.last.last_mut().unwrap() = id;
     }
     fn i32f(&mut self, id: i16, v: i32) {
         self.field(id, CT_I32);

@@ -1225,6 +1225,75 @@ impl Worker {
     }
 }
 
+// ======================================================================= sampling profiler
+// Measurement only (SS_PROF=<file>): ITIMER_PROF delivers SIGPROF to whichever thread is
+// using CPU; the handler stores that thread's instruction pointer. At exit the samples are
+// written as offsets into the executable, for `addr2line -f -i`. Needs no perf permissions.
+
+const PROF_N: usize = 1 << 20;
+static PROF_IDX: AtomicUsize = AtomicUsize::new(0);
+static mut PROF_BUF: [u64; PROF_N] = [0; PROF_N];
+
+extern "C" fn on_sigprof(_sig: libc::c_int, _info: *mut libc::siginfo_t, ctx: *mut libc::c_void) {
+    // SAFETY: called by the kernel with a valid ucontext; slots are claimed atomically.
+    unsafe {
+        let uc = ctx as *const libc::ucontext_t;
+        let rip = (*uc).uc_mcontext.gregs[libc::REG_RIP as usize] as u64;
+        let i = PROF_IDX.fetch_add(1, AtOrd::Relaxed);
+        if i < PROF_N {
+            std::ptr::addr_of_mut!(PROF_BUF).cast::<u64>().add(i).write(rip);
+        }
+    }
+}
+
+fn prof_start() {
+    if std::env::var_os("SS_PROF").is_none() {
+        return;
+    }
+    // SAFETY: installing a signal handler and an interval timer for this process.
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_sigprof as *const () as usize;
+        sa.sa_flags = libc::SA_SIGINFO | libc::SA_RESTART;
+        libc::sigaction(libc::SIGPROF, &sa, std::ptr::null_mut());
+        let tv = libc::timeval { tv_sec: 0, tv_usec: 200 };
+        let it = libc::itimerval { it_interval: tv, it_value: tv };
+        libc::setitimer(libc::ITIMER_PROF, &it, std::ptr::null_mut());
+    }
+}
+
+fn prof_dump() {
+    let Some(path) = std::env::var_os("SS_PROF") else { return };
+    // SAFETY: stop the timer before reading the buffer.
+    unsafe {
+        let z = libc::itimerval {
+            it_interval: libc::timeval { tv_sec: 0, tv_usec: 0 },
+            it_value: libc::timeval { tv_sec: 0, tv_usec: 0 },
+        };
+        libc::setitimer(libc::ITIMER_PROF, &z, std::ptr::null_mut());
+    }
+    let n = PROF_IDX.load(AtOrd::Relaxed).min(PROF_N);
+    // load address of the executable: first mapping of /proc/self/exe in /proc/self/maps
+    let exe = std::fs::read_link("/proc/self/exe").unwrap_or_default();
+    let maps = std::fs::read_to_string("/proc/self/maps").unwrap_or_default();
+    let mut base = 0u64;
+    for line in maps.lines() {
+        if line.ends_with(exe.to_str().unwrap_or("?")) {
+            let start = line.split('-').next().unwrap_or("0");
+            base = u64::from_str_radix(start, 16).unwrap_or(0);
+            break;
+        }
+    }
+    let mut out = String::new();
+    for i in 0..n {
+        // SAFETY: slots below n were written by the handler; the timer is stopped.
+        let rip = unsafe { std::ptr::addr_of!(PROF_BUF).cast::<u64>().add(i).read() };
+        out.push_str(&format!("0x{:x}\n", rip.wrapping_sub(base)));
+    }
+    let _ = std::fs::write(path, out);
+    eprintln!("shopping: profile: {n} samples");
+}
+
 // ======================================================================= main
 
 fn main() {
@@ -1277,8 +1346,18 @@ impl<T> Gate<T> {
     }
 }
 
+extern "C" {
+    fn mi_option_set(option: i32, value: std::ffi::c_long);
+}
+
 fn run() -> Res<()> {
     let t0 = Instant::now();
+    if std::env::var_os("SS_MI_DEFAULT").is_none() {
+        // SAFETY: mimalloc option setter (v3: 15 = purge_delay; -1 = never return memory to
+        // the OS), so buffers freed by one stage are reused, not faulted in again, by the next.
+        unsafe { mi_option_set(15, -1) };
+    }
+    prof_start();
     let args: Vec<String> = std::env::args().collect();
     let (data_dir, out_dir) = if args.len() >= 3 {
         (PathBuf::from(&args[args.len() - 2]), PathBuf::from(&args[args.len() - 1]))
@@ -1474,11 +1553,10 @@ fn run() -> Res<()> {
     let next = AtomicUsize::new(0);
     let n_ev_recs: usize = outs.iter().map(|o| o.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
     let pe_est = n_ev_recs / nthreads / NPART * 3 / 2 + 64;
-    let ue_outs: Vec<Vec<Vec<PEv>>> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|_| {
+    let ue_outs: Vec<Vec<Vec<PEv>>> = rayon::broadcast(|_bc| {
+        {
                 let (next, outs) = (&next, &outs);
-                s.spawn(move || {
+                (move || {
                     let mut parts: Vec<Vec<PEv>> =
                         (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
                     let mut table: Vec<u64> = Vec::new();
@@ -1562,10 +1640,8 @@ fn run() -> Res<()> {
                         }
                     }
                     parts
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })()
+        }
     });
     let cu_outs: Vec<Vec<Vec<PCl>>> = outs.into_iter().map(|o| o.cl).collect();
     stage!(t0, "dedup events");
@@ -1574,11 +1650,10 @@ fn run() -> Res<()> {
     let next = AtomicUsize::new(0);
     let n_cl: usize = cu_outs.iter().map(|o| o.iter().map(|v| v.len()).sum::<usize>()).sum();
     let pc_est = n_cl / nthreads / NPART * 3 / 2 + 64;
-    let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|_| {
+    let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = rayon::broadcast(|_bc| {
+        {
                 let (next, ue_outs, cu_outs, pmap) = (&next, &ue_outs, &cu_outs, &pmap);
-                s.spawn(move || {
+                (move || {
                     let mut parts: Vec<Vec<PEv>> =
                         (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
                     let mut cparts: Vec<Vec<PCl>> =
@@ -1603,10 +1678,8 @@ fn run() -> Res<()> {
                         }
                     }
                     (parts, cparts)
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })()
+        }
     });
     drop(ue_outs);
     drop(cu_outs);
@@ -1621,11 +1694,10 @@ fn run() -> Res<()> {
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let order: Vec<usize> = order.into_iter().map(|x| x.1).collect();
-    let workers: Vec<Worker> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|_| {
+    let workers: Vec<Worker> = rayon::broadcast(|_bc| {
+        {
                 let (next, pe_outs, cl_outs, ctx, order) = (&next, &pe_outs, &cl_outs, &ctx, &order);
-                s.spawn(move || {
+                (move || {
                     let mut w = Worker::new(ctx, ncat);
                     let (mut evs2, mut cls2): (Vec<PEv>, Vec<PCl>) = (Vec::new(), Vec::new());
                     let (mut eoff, mut coff): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
@@ -1701,10 +1773,8 @@ fn run() -> Res<()> {
                         eprintln!("sessions thread: gather {} ms, sort {} ms, persons {} ms", tg / 1_000_000, tso / 1_000_000, tp / 1_000_000);
                     }
                     w
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
+                })()
+        }
     });
     stage!(t0, "sessions");
 
@@ -1889,6 +1959,7 @@ fn run() -> Res<()> {
     r1?;
     r2?;
     stage!(t0, "written");
+    prof_dump();
     // all files are closed; exit without freeing the heap
     std::process::exit(0)
 }

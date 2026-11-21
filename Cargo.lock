@@ -445,6 +445,7 @@ name = "shopping-sessions"
 version = "0.1.0"
 dependencies = [
  "hashbrown 0.16.1",
+ "libc",
  "memchr",
  "memmap2",
  "mimalloc",

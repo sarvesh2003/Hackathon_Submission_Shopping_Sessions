@@ -388,8 +388,49 @@ fn parse_ts(s: &[u8]) -> Option<i64> {
     Some(v)
 }
 
+#[inline(always)]
+fn le64(s: &[u8], i: usize) -> u64 {
+    u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
+}
+
+/// True if every byte selected by `mask` (0xFF per byte) is an ASCII digit.
+#[inline(always)]
+fn swar_digits(x: u64, mask: u64) -> bool {
+    const HI: u64 = 0xF0F0_F0F0_F0F0_F0F0;
+    const THREES: u64 = 0x3030_3030_3030_3030;
+    const SIXES: u64 = 0x0606_0606_0606_0606;
+    let d = x & mask;
+    // high nibble must be 3, and adding 6 must not carry into it (rejects 0x3A..0x3F)
+    (d & HI & mask) == (THREES & mask) && (d.wrapping_add(SIXES & mask) & HI & mask) == (THREES & mask)
+}
+
+/// F1 `YYYY-MM-DDTHH:MM:SSZ` or F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` (length 20 / 25, s[4] == '-').
 #[inline]
 fn parse_iso(s: &[u8]) -> Option<i64> {
+    let a = le64(s, 0); // YYYY-MM-
+    let b = le64(s, 8); // DDTHH:MM
+    let c = le64(s, s.len() - 8); // last 8 bytes; holds ":SS" at a length-dependent offset
+    // separators: a[4]='-' a[7]='-'; b[2]='T' b[5]=':'
+    const A_SEP_MASK: u64 = 0xFF00_00FF_0000_0000;
+    const A_SEP: u64 = 0x2D00_002D_0000_0000;
+    const B_SEP_MASK: u64 = 0x0000_FF00_00FF_0000;
+    const B_SEP: u64 = 0x0000_3A00_0054_0000;
+    const A_DIG: u64 = 0x00FF_FF00_FFFF_FFFF;
+    const B_DIG: u64 = 0xFFFF_00FF_FF00_FFFF;
+    if (a & A_SEP_MASK) != A_SEP
+        || (b & B_SEP_MASK) != B_SEP
+        || s[16] != b':'
+        || !swar_digits(a, A_DIG)
+        || !swar_digits(b, B_DIG)
+    {
+        return None;
+    }
+    let _ = c;
+    let s17 = s[17].wrapping_sub(b'0');
+    let s18 = s[18].wrapping_sub(b'0');
+    if s17 > 9 || s18 > 9 {
+        return None;
+    }
     let offset_ms = if s.len() == 20 {
         if s[19] != b'Z' {
             return None;
@@ -411,15 +452,15 @@ fn parse_iso(s: &[u8]) -> Option<i64> {
         }
         sign * (oh * 3600 + om * 60) * 1000
     };
-    if s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
-        return None;
-    }
-    let year = d2(s, 0)? * 100 + d2(s, 2)?;
-    let month = d2(s, 5)?;
-    let day = d2(s, 8)?;
-    let hour = d2(s, 11)?;
-    let minute = d2(s, 14)?;
-    let second = d2(s, 17)?;
+    let da = a ^ 0x3030_3030_3030_3030;
+    let db = b ^ 0x3030_3030_3030_3030;
+    let by = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as i64;
+    let year = by(da, 0) * 1000 + by(da, 1) * 100 + by(da, 2) * 10 + by(da, 3);
+    let month = by(da, 5) * 10 + by(da, 6);
+    let day = by(db, 0) * 10 + by(db, 1);
+    let hour = by(db, 3) * 10 + by(db, 4);
+    let minute = by(db, 6) * 10 + by(db, 7);
+    let second = (s17 * 10 + s18) as i64;
     if !(1..=12).contains(&month)
         || day < 1
         || day > days_in_month(year, month)
@@ -1639,4 +1680,153 @@ fn write_parquet(path: &Path, schema: &str, rows: usize, cols: Vec<Col>) -> Res<
     }
     writer.close()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The reference implementation of timestamp parsing (same logic as src/bin/reference.rs).
+    fn ref_parse_ts(s: &[u8]) -> Option<i64> {
+        fn num(b: &[u8]) -> Option<i64> {
+            if b.is_empty() {
+                return None;
+            }
+            let mut v: i64 = 0;
+            for &c in b {
+                if !c.is_ascii_digit() {
+                    return None;
+                }
+                v = v * 10 + (c - b'0') as i64;
+            }
+            Some(v)
+        }
+        if s.is_empty() {
+            return None;
+        }
+        if s.iter().all(|c| c.is_ascii_digit()) {
+            let mut v: i64 = 0;
+            for &c in s {
+                v = v.checked_mul(10)?.checked_add((c - b'0') as i64)?;
+            }
+            return Some(v);
+        }
+        let offset_ms = match s.len() {
+            20 => {
+                if s[19] != b'Z' {
+                    return None;
+                }
+                0
+            }
+            25 => {
+                let sign = match s[19] {
+                    b'+' => 1,
+                    b'-' => -1,
+                    _ => return None,
+                };
+                if s[22] != b':' {
+                    return None;
+                }
+                let oh = num(&s[20..22])?;
+                let om = num(&s[23..25])?;
+                if oh > 23 || om > 59 {
+                    return None;
+                }
+                sign * (oh * 3600 + om * 60) * 1000
+            }
+            _ => return None,
+        };
+        if s[4] != b'-' || s[7] != b'-' || s[10] != b'T' || s[13] != b':' || s[16] != b':' {
+            return None;
+        }
+        let (y, mo, d) = (num(&s[0..4])?, num(&s[5..7])?, num(&s[8..10])?);
+        let (h, mi, se) = (num(&s[11..13])?, num(&s[14..16])?, num(&s[17..19])?);
+        if !(1..=12).contains(&mo) || d < 1 || d > days_in_month(y, mo) || h > 23 || mi > 59 || se > 59 {
+            return None;
+        }
+        Some((days_from_civil(y, mo, d) * 86_400 + h * 3600 + mi * 60 + se) * 1000 - offset_ms)
+    }
+
+
+    fn split_reference<const N: usize>(chunk: &[u8]) -> Vec<Vec<Vec<u8>>> {
+        let mut out = Vec::new();
+        for line in chunk.split(|&b| b == b'\n') {
+            let mut f: [&[u8]; N] = [&[]; N];
+            if split_fields(line, &mut f) {
+                out.push(f.iter().map(|v| v.to_vec()).collect());
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn splitters_match_reference() {
+        let alphabet: &[u8] = b"aab,,\"\"\n ";
+        let mut rng: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        for round in 0..20_000 {
+            let n = (next() % 300) as usize;
+            let chunk: Vec<u8> = (0..n).map(|_| alphabet[(next() as usize) % alphabet.len()]).collect();
+            let want = split_reference::<3>(&chunk);
+            let mut got1 = Vec::new();
+            for_each_record::<3>(&chunk, |f| got1.push(f.iter().map(|v| v.to_vec()).collect::<Vec<_>>()));
+            assert_eq!(got1, want, "v1 round {round}: {:?}", String::from_utf8_lossy(&chunk));
+        }
+    }
+
+    #[test]
+    fn timestamps_match_reference() {
+        let templates: &[&[u8]] = &[
+            b"2026-10-03T23:58:10Z",
+            b"2028-02-29T00:00:00Z",
+            b"2027-02-28T23:59:59Z",
+            b"2026-10-03T19:58:10-04:00",
+            b"2026-10-04T01:30:00+02:00",
+            b"2026-10-04T01:30:00+23:59",
+            b"2026-10-04T01:30:00-00:00",
+            b"1791071890000",
+            b"0001791021600000",
+        ];
+        let alphabet: &[u8] = b"0123456789-+:TZtz /.\x00\xff9\x2f\x3a\x3f";
+        let mut rng: u64 = 0x1234_5678_9abc_def1;
+        let mut next = || {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            rng
+        };
+        let mut checked = 0u64;
+        for t in templates {
+            assert_eq!(parse_ts(t), ref_parse_ts(t), "{:?}", String::from_utf8_lossy(t));
+            for _ in 0..400_000 {
+                let mut v = t.to_vec();
+                for _ in 0..(1 + next() % 2) {
+                    let i = (next() as usize) % v.len();
+                    v[i] = alphabet[(next() as usize) % alphabet.len()];
+                }
+                assert_eq!(parse_ts(&v), ref_parse_ts(&v), "{:?}", String::from_utf8_lossy(&v));
+                checked += 1;
+            }
+        }
+        // every day of 2024..=2029 at a few times, both forms
+        for y in 2024..=2029 {
+            for m in 0..=13 {
+                for d in 0..=32 {
+                    for hms in ["00:00:00", "23:59:59", "12:30:00", "24:00:00", "23:60:00", "23:59:60"] {
+                        let f1 = format!("{y:04}-{m:02}-{d:02}T{hms}Z");
+                        let f2 = format!("{y:04}-{m:02}-{d:02}T{hms}+05:30");
+                        assert_eq!(parse_ts(f1.as_bytes()), ref_parse_ts(f1.as_bytes()), "{f1}");
+                        assert_eq!(parse_ts(f2.as_bytes()), ref_parse_ts(f2.as_bytes()), "{f2}");
+                        checked += 2;
+                    }
+                }
+            }
+        }
+        eprintln!("checked {checked} timestamps");
+    }
 }

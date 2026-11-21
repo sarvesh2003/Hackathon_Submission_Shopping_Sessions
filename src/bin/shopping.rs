@@ -766,14 +766,45 @@ fn parse_links(link_chunks: &[&[u8]]) -> Vec<Vec<(u64, u64)>> {
         .collect()
 }
 
-/// Maps every linked ID whose person is not itself to its person's key.
-/// Partitioned by `part_of(id)` so the maps can be built in parallel.
-struct PersonMap {
-    parts: Vec<HashMap<u64, u64>>,
+/// Maps every linked ID whose person is not itself to its person's key: one flat
+/// open-addressing table of [key, person] pairs (key 0 = empty slot; no ID packs to 0).
+struct PersonTable {
+    slots: Vec<[u64; 2]>,
+    bits: u32,
 }
 
+impl PersonTable {
+    #[inline(always)]
+    fn slot(&self, k: u64) -> usize {
+        (k.wrapping_mul(0x9FB2_1C65_1E98_DF25) >> (64 - self.bits)) as usize
+    }
+    #[inline(always)]
+    fn prefetch(&self, k: u64) {
+        #[cfg(target_arch = "x86_64")]
+        // SAFETY: the address is inside `slots`; prefetch never faults anyway.
+        unsafe {
+            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+            _mm_prefetch(self.slots.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0);
+        }
+    }
+    #[inline(always)]
+    fn person(&self, k: u64) -> u64 {
+        let mask = self.slots.len() - 1;
+        let mut h = self.slot(k);
+        loop {
+            let e = self.slots[h];
+            if e[0] == k {
+                return e[1];
+            }
+            if e[0] == 0 {
+                return k;
+            }
+            h = (h + 1) & mask;
+        }
+    }
+}
 
-fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
+fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonTable {
     // dense indices: sorted unique keys
     let mut keys: Vec<u64> = pairs.par_iter().flat_map_iter(|v| v.iter().flat_map(|&(a, b)| [a, b])).collect();
     keys.par_sort_unstable();
@@ -817,23 +848,22 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
             best[r] = keys[i];
         }
     }
-    // scatter (id, person) by partition, then build the small maps in parallel
-    let mut by_part: Vec<Vec<(u64, u64)>> = new_parts();
+    // table of the IDs whose person is another ID
+    let n_map = (0..n).filter(|&i| best[roots[i] as usize] != keys[i]).count();
+    let bits = (2 * n_map).max(16).next_power_of_two().trailing_zeros();
+    let mut t = PersonTable { slots: vec![[0u64; 2]; 1 << bits], bits };
+    let mask = t.slots.len() - 1;
     for i in 0..n {
         let b = best[roots[i] as usize];
         if b != keys[i] {
-            by_part[part_of(keys[i])].push((keys[i], b)); // own-person IDs need no entry
+            let mut h = t.slot(keys[i]);
+            while t.slots[h][0] != 0 {
+                h = (h + 1) & mask;
+            }
+            t.slots[h] = [keys[i], b];
         }
     }
-    let parts = by_part
-        .into_par_iter()
-        .map(|v| {
-            let mut m = HashMap::with_capacity(v.len());
-            m.extend(v);
-            m
-        })
-        .collect();
-    PersonMap { parts }
+    t
 }
 
 // ======================================================================= per-person work
@@ -1057,9 +1087,6 @@ macro_rules! stage {
     };
 }
 
-fn new_parts<T>() -> Vec<Vec<T>> {
-    (0..NPART).map(|_| Vec::new()).collect()
-}
 
 /// What one parse thread produces.
 struct ParseOut {
@@ -1222,7 +1249,7 @@ fn run() -> Res<()> {
     stage!(t0, "parsed links");
 
     // ---- worker 0: union-find, then parse; others: events first, clicks once the map exists
-    let gate: Gate<PersonMap> = Gate::new();
+    let gate: Gate<PersonTable> = Gate::new();
     let next = AtomicUsize::new(0);
     let n_ev = event_chunks.len();
     let n_all = n_ev + click_chunks.len();
@@ -1275,23 +1302,60 @@ fn run() -> Res<()> {
     let pmap = gate.wait();
     stage!(t0, "parsed events + clicks");
 
-    // ---- dedup events per event_id partition, scatter survivors by person
+    // ---- dedup events per event_id partition; look up each survivor's person (batched with
+    // prefetch) and scatter by person. Clicks get the same lookup as extra work items.
     let next = AtomicUsize::new(0);
     let n_ev_recs: usize = outs.iter().map(|o| o.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
     let pe_est = n_ev_recs / nthreads / NPART * 3 / 2 + 64;
-    let ue_outs: Vec<Vec<Vec<PEv>>> = std::thread::scope(|s| {
+    let n_cl: usize = outs.iter().map(|o| o.cl.iter().map(|v| v.len()).sum::<usize>()).sum();
+    let pc_est = n_cl / nthreads / NPART * 3 / 2 + 64;
+    const BATCH: usize = 32;
+    let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
-                let (next, outs) = (&next, &outs);
+                let (next, outs, pmap) = (&next, &outs, &pmap);
                 s.spawn(move || {
                     let mut parts: Vec<Vec<PEv>> =
                         (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
+                    let mut cparts: Vec<Vec<PCl>> =
+                        (0..NPART).map(|_| Vec::with_capacity(pc_est)).collect();
                     let mut table: Vec<u32> = Vec::new();
                     let mut srcs: Vec<&[EvRec]> = Vec::with_capacity(outs.len());
+                    let mut batch: Vec<PEv> = Vec::with_capacity(BATCH);
+                    let mut cbatch: Vec<PCl> = Vec::with_capacity(BATCH);
+                    let flush = |batch: &mut Vec<PEv>, parts: &mut Vec<Vec<PEv>>| {
+                        for e in batch.iter() {
+                            let person = pmap.person(e.person);
+                            parts[part_of(person)].push(PEv { person, ts: e.ts, pc: e.pc });
+                        }
+                        batch.clear();
+                    };
+                    let cflush = |cbatch: &mut Vec<PCl>, cparts: &mut Vec<Vec<PCl>>| {
+                        for c in cbatch.iter() {
+                            let person = pmap.person(c.person);
+                            cparts[part_of(person)].push(PCl { person, ..*c });
+                        }
+                        cbatch.clear();
+                    };
                     loop {
                         let p = next.fetch_add(1, AtOrd::Relaxed);
-                        if p >= NPART {
+                        if p >= 2 * NPART {
                             break;
+                        }
+                        if p >= NPART {
+                            // clicks (partitioned by user): person lookup, scatter by person
+                            let q = p - NPART;
+                            for o in outs.iter() {
+                                for c in &o.cl[q] {
+                                    pmap.prefetch(c.person);
+                                    cbatch.push(*c);
+                                    if cbatch.len() == BATCH {
+                                        cflush(&mut cbatch, &mut cparts);
+                                    }
+                                }
+                            }
+                            cflush(&mut cbatch, &mut cparts);
+                            continue;
                         }
                         // records are addressed in place as (source thread << 24 | index)
                         srcs.clear();
@@ -1332,52 +1396,15 @@ fn run() -> Res<()> {
                             if s != u32::MAX {
                                 let r = rec(s);
                                 if r.user != INVALID {
-                                    // person resolved in the next pass (partitioned join)
-                                    parts[part_of(r.user)].push(PEv { person: r.user, ts: r.ts, pc: r.pc });
+                                    pmap.prefetch(r.user);
+                                    batch.push(PEv { person: r.user, ts: r.ts, pc: r.pc });
+                                    if batch.len() == BATCH {
+                                        flush(&mut batch, &mut parts);
+                                    }
                                 }
                             }
                         }
-                    }
-                    parts
-                })
-            })
-            .collect();
-        handles.into_iter().map(|h| h.join().unwrap()).collect()
-    });
-    let cu_outs: Vec<Vec<Vec<PCl>>> = outs.into_iter().map(|o| o.cl).collect();
-    stage!(t0, "dedup events");
-
-    // ---- resolve persons: user partition q only needs the small map pmap.parts[q]
-    let next = AtomicUsize::new(0);
-    let n_cl: usize = cu_outs.iter().map(|o| o.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let pc_est = n_cl / nthreads / NPART * 3 / 2 + 64;
-    let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = std::thread::scope(|s| {
-        let handles: Vec<_> = (0..nthreads)
-            .map(|_| {
-                let (next, ue_outs, cu_outs, pmap) = (&next, &ue_outs, &cu_outs, &pmap);
-                s.spawn(move || {
-                    let mut parts: Vec<Vec<PEv>> =
-                        (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
-                    let mut cparts: Vec<Vec<PCl>> =
-                        (0..NPART).map(|_| Vec::with_capacity(pc_est)).collect();
-                    loop {
-                        let q = next.fetch_add(1, AtOrd::Relaxed);
-                        if q >= NPART {
-                            break;
-                        }
-                        let m = &pmap.parts[q];
-                        for o in ue_outs.iter() {
-                            for e in &o[q] {
-                                let person = m.get(&e.person).copied().unwrap_or(e.person);
-                                parts[part_of(person)].push(PEv { person, ts: e.ts, pc: e.pc });
-                            }
-                        }
-                        for o in cu_outs.iter() {
-                            for c in &o[q] {
-                                let person = m.get(&c.person).copied().unwrap_or(c.person);
-                                cparts[part_of(person)].push(PCl { person, ..*c });
-                            }
-                        }
+                        flush(&mut batch, &mut parts);
                     }
                     (parts, cparts)
                 })
@@ -1385,10 +1412,9 @@ fn run() -> Res<()> {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    drop(ue_outs);
-    drop(cu_outs);
+    drop(outs);
     let (pe_outs, cl_outs): (Vec<Vec<Vec<PEv>>>, Vec<Vec<Vec<PCl>>>) = resolved.into_iter().unzip();
-    stage!(t0, "resolved persons");
+    stage!(t0, "dedup events + persons");
 
     // ---- per person partition: sessions, credit, assists
     let ncat = cat_names.len();

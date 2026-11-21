@@ -1011,7 +1011,10 @@ struct Worker {
     ndays: usize,
     ncamp: usize,
     day0_ms: i64, // ms from window_start back to the start of day 0 (<= 0)
-    camp: Vec<CampAcc>, // (ncamp + 1) * ndays
+    // per (campaign, day), split hot/cold so a thread's counters stay small in L2:
+    camp_assisted: Vec<u32>, // touched on every assist run
+    camp_sp: Vec<[u32; 2]>,  // credited sessions, purchasing sessions
+    camp_rev: Vec<u64>,      // credited revenue (written only for purchasing sessions)
     rows: Vec<URow>,
     sessions: Vec<Sess>,
     cat_sum: Vec<u64>,
@@ -1026,7 +1029,9 @@ impl Worker {
             ndays: ctx.ndays,
             ncamp: ctx.ncamp,
             day0_ms: ctx.ws_day * DAY_MS - ctx.ws,
-            camp: vec![CampAcc::default(); (ctx.ncamp + 1) * ctx.ndays],
+            camp_assisted: vec![0; (ctx.ncamp + 1) * ctx.ndays],
+            camp_sp: vec![[0; 2]; (ctx.ncamp + 1) * ctx.ndays],
+            camp_rev: vec![0; (ctx.ncamp + 1) * ctx.ndays],
             rows: Vec::new(),
             sessions: Vec::new(),
             cat_sum: vec![0; ncat],
@@ -1058,7 +1063,7 @@ impl Worker {
         while s < b {
             let d = self.sessions[s].day as usize;
             let e = b.min(self.day_first[d + 1] as usize);
-            self.camp[c * self.ndays + d].assisted += (e - s) as u64;
+            self.camp_assisted[c * self.ndays + d] += (e - s) as u32;
             s = e;
         }
     }
@@ -1110,10 +1115,12 @@ impl Worker {
         let nd = self.ndays;
         if cls.is_empty() {
             for s in &self.sessions {
-                let a = &mut self.camp[organic * nd + s.day as usize];
-                a.sessions += 1;
-                a.purchasing += s.purchase as u64;
-                a.revenue += s.revenue;
+                let k = organic * nd + s.day as usize;
+                self.camp_sp[k][0] += 1;
+                if s.purchase {
+                    self.camp_sp[k][1] += 1;
+                    self.camp_rev[k] += s.revenue;
+                }
             }
             return;
         }
@@ -1167,10 +1174,12 @@ impl Worker {
             } else {
                 organic
             };
-            let a = &mut self.camp[credited * nd + s.day as usize];
-            a.sessions += 1;
-            a.purchasing += s.purchase as u64;
-            a.revenue += s.revenue;
+            let k = credited * nd + s.day as usize;
+            self.camp_sp[k][0] += 1;
+            if s.purchase {
+                self.camp_sp[k][1] += 1;
+                self.camp_rev[k] += s.revenue;
+            }
         }
         for k in lo..hi {
             let c = cls[k].camp as usize;
@@ -1669,11 +1678,11 @@ fn run() -> Res<()> {
     // ---- merge campaign accumulators
     let mut camp_total = vec![CampAcc::default(); (ctx.ncamp + 1) * ndays];
     for w in &workers {
-        for (t, a) in camp_total.iter_mut().zip(&w.camp) {
-            t.sessions += a.sessions;
-            t.purchasing += a.purchasing;
-            t.revenue += a.revenue;
-            t.assisted += a.assisted;
+        for (k, t) in camp_total.iter_mut().enumerate() {
+            t.sessions += w.camp_sp[k][0] as u64;
+            t.purchasing += w.camp_sp[k][1] as u64;
+            t.revenue += w.camp_rev[k];
+            t.assisted += w.camp_assisted[k] as u64;
         }
     }
 

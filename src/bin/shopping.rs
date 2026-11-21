@@ -612,7 +612,7 @@ struct EvRec {
 }
 
 /// A surviving event, keyed by person. 16 bytes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct PEv {
     person: u64,
     ts: u32,
@@ -620,7 +620,7 @@ struct PEv {
 }
 
 /// A valid click, keyed by person. 24 bytes.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Default)]
 struct PCl {
     person: u64,
     cid: u64,
@@ -1205,7 +1205,6 @@ fn run() -> Res<()> {
                         ev: (0..NPART).map(|_| Vec::with_capacity(est)).collect(),
                         cl: (0..NPART).map(|_| Vec::with_capacity(cl_est)).collect(),
                     };
-                    let mut pmap: Option<Arc<PersonMap>> = None;
                     loop {
                         let i = next.fetch_add(1, AtOrd::Relaxed);
                         if i >= n_all {
@@ -1219,11 +1218,10 @@ fn run() -> Res<()> {
                                 }
                             });
                         } else {
-                            let pm = pmap.get_or_insert_with(|| gate.wait()).clone();
+                            // by user partition; the person is resolved later (partitioned join)
                             for_each_record::<4>(click_chunks[i - n_ev], |f| {
                                 if let Some((user, ts, cid, camp)) = parse_click(f, ctx) {
-                                    let person = pm.person(user);
-                                    out.cl[part_of(person)].push(PCl { person, cid, ts, camp });
+                                    out.cl[part_of(user)].push(PCl { person: user, cid, ts, camp });
                                 }
                             });
                         }
@@ -1248,47 +1246,51 @@ fn run() -> Res<()> {
                 s.spawn(move || {
                     let mut parts: Vec<Vec<PEv>> =
                         (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
-                    let mut recs: Vec<EvRec> = Vec::new();
                     let mut table: Vec<u32> = Vec::new();
+                    let mut srcs: Vec<&[EvRec]> = Vec::with_capacity(outs.len());
                     loop {
                         let p = next.fetch_add(1, AtOrd::Relaxed);
                         if p >= NPART {
                             break;
                         }
-                        recs.clear();
-                        for o in outs.iter() {
-                            recs.extend_from_slice(&o.ev[p]);
-                        }
-                        let n = recs.len();
+                        // records are addressed in place as (source thread << 24 | index)
+                        srcs.clear();
+                        srcs.extend(outs.iter().map(|o| &o.ev[p][..]));
+                        assert!(srcs.len() <= 255 && srcs.iter().all(|v| v.len() < 1 << 24));
+                        let n: usize = srcs.iter().map(|v| v.len()).sum();
                         if n == 0 {
                             continue;
                         }
+                        let rec = |id: u32| -> &EvRec { &srcs[(id >> 24) as usize][(id & 0xFF_FFFF) as usize] };
                         let bits = (2 * n).next_power_of_two().trailing_zeros().max(4);
                         let mask = (1usize << bits) - 1;
                         table.clear();
                         table.resize(1 << bits, u32::MAX);
-                        for i in 0..n {
-                            let k = recs[i].eid;
-                            let mut h = (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> (64 - bits)) as usize;
-                            loop {
-                                let s = table[h];
-                                if s == u32::MAX {
-                                    table[h] = i as u32;
-                                    break;
-                                }
-                                let r = &recs[s as usize];
-                                if r.eid == k {
-                                    if recs[i].ingest < r.ingest {
-                                        table[h] = i as u32;
+                        for (t, src) in srcs.iter().enumerate() {
+                            for (i, cur) in src.iter().enumerate() {
+                                let id = ((t as u32) << 24) | i as u32;
+                                let k = cur.eid;
+                                let mut h = (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> (64 - bits)) as usize;
+                                loop {
+                                    let s = table[h];
+                                    if s == u32::MAX {
+                                        table[h] = id;
+                                        break;
                                     }
-                                    break;
+                                    let r = rec(s);
+                                    if r.eid == k {
+                                        if cur.ingest < r.ingest {
+                                            table[h] = id;
+                                        }
+                                        break;
+                                    }
+                                    h = (h + 1) & mask;
                                 }
-                                h = (h + 1) & mask;
                             }
                         }
                         for &s in table.iter() {
                             if s != u32::MAX {
-                                let r = &recs[s as usize];
+                                let r = rec(s);
                                 if r.user != INVALID {
                                     // person resolved in the next pass (partitioned join)
                                     parts[part_of(r.user)].push(PEv { person: r.user, ts: r.ts, pc: r.pc });
@@ -1302,21 +1304,22 @@ fn run() -> Res<()> {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    let cl_outs: Vec<Vec<Vec<PCl>>> = outs
-        .into_iter()
-        .map(|o| o.cl)
-        .collect();
+    let cu_outs: Vec<Vec<Vec<PCl>>> = outs.into_iter().map(|o| o.cl).collect();
     stage!(t0, "dedup events");
 
     // ---- resolve persons: user partition q only needs the small map pmap.parts[q]
     let next = AtomicUsize::new(0);
-    let pe_outs: Vec<Vec<Vec<PEv>>> = std::thread::scope(|s| {
+    let n_cl: usize = cu_outs.iter().map(|o| o.iter().map(|v| v.len()).sum::<usize>()).sum();
+    let pc_est = n_cl / nthreads / NPART * 9 / 8 + 16;
+    let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
-                let (next, ue_outs, pmap) = (&next, &ue_outs, &pmap);
+                let (next, ue_outs, cu_outs, pmap) = (&next, &ue_outs, &cu_outs, &pmap);
                 s.spawn(move || {
                     let mut parts: Vec<Vec<PEv>> =
                         (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
+                    let mut cparts: Vec<Vec<PCl>> =
+                        (0..NPART).map(|_| Vec::with_capacity(pc_est)).collect();
                     loop {
                         let q = next.fetch_add(1, AtOrd::Relaxed);
                         if q >= NPART {
@@ -1329,14 +1332,22 @@ fn run() -> Res<()> {
                                 parts[part_of(person)].push(PEv { person, ts: e.ts, pc: e.pc });
                             }
                         }
+                        for o in cu_outs.iter() {
+                            for c in &o[q] {
+                                let person = m.get(&c.person).copied().unwrap_or(c.person);
+                                cparts[part_of(person)].push(PCl { person, ..*c });
+                            }
+                        }
                     }
-                    parts
+                    (parts, cparts)
                 })
             })
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
     drop(ue_outs);
+    drop(cu_outs);
+    let (pe_outs, cl_outs): (Vec<Vec<Vec<PEv>>>, Vec<Vec<Vec<PCl>>>) = resolved.into_iter().unzip();
     stage!(t0, "resolved persons");
 
     // ---- per person partition: sessions, credit, assists
@@ -1348,8 +1359,6 @@ fn run() -> Res<()> {
                 let (next, pe_outs, cl_outs, ctx) = (&next, &pe_outs, &cl_outs, &ctx);
                 s.spawn(move || {
                     let mut w = Worker::new(ctx, ncat);
-                    let mut evs: Vec<PEv> = Vec::new();
-                    let mut cls: Vec<PCl> = Vec::new();
                     let (mut evs2, mut cls2): (Vec<PEv>, Vec<PCl>) = (Vec::new(), Vec::new());
                     let (mut eoff, mut coff): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
                     let (mut tg, mut tso, mut tp) = (0u64, 0u64, 0u64);
@@ -1359,22 +1368,17 @@ fn run() -> Res<()> {
                             break;
                         }
                         let ta = Instant::now();
-                        evs.clear();
-                        for o in pe_outs.iter() {
-                            evs.extend_from_slice(&o[p]);
-                        }
-                        cls.clear();
-                        for o in cl_outs.iter() {
-                            cls.extend_from_slice(&o[p]);
-                        }
+                        let esrc: Vec<&[PEv]> = pe_outs.iter().map(|o| &o[p][..]).collect();
+                        let csrc: Vec<&[PCl]> = cl_outs.iter().map(|o| &o[p][..]).collect();
+                        let n_e: usize = esrc.iter().map(|v| v.len()).sum();
                         let tb = Instant::now();
                         // group by person: counting sort into hash buckets (about one person
                         // each), then sort each small bucket by (person, ts)
-                        let bbits = (evs.len() / 16).max(16).next_power_of_two().trailing_zeros();
+                        let bbits = (n_e / 16).max(16).next_power_of_two().trailing_zeros();
                         let nb = 1usize << bbits;
                         let bucket = |k: u64| (k.wrapping_mul(0xA24B_AED4_963E_E407) >> (64 - bbits)) as usize;
-                        counting_sort(&evs, &mut evs2, &mut eoff, nb, |e| bucket(e.person));
-                        counting_sort(&cls, &mut cls2, &mut coff, nb, |c| bucket(c.person));
+                        counting_sort(&esrc, &mut evs2, &mut eoff, nb, |e| bucket(e.person));
+                        counting_sort(&csrc, &mut cls2, &mut coff, nb, |c| bucket(c.person));
                         let tc = Instant::now();
                         tg += (tb - ta).as_nanos() as u64;
                         tso += (tc - tb).as_nanos() as u64;
@@ -1609,26 +1613,37 @@ fn run() -> Res<()> {
     std::process::exit(0)
 }
 
-/// Stable counting sort of `src` into `dst` by `key` (< nb); `off[b]..off[b+1]` = bucket b.
+/// Counting sort of the concatenation of `srcs` into `dst` by `key` (< nb);
+/// `off[b]..off[b+1]` = bucket b.
 #[inline]
-fn counting_sort<T: Copy>(src: &[T], dst: &mut Vec<T>, off: &mut Vec<u32>, nb: usize, key: impl Fn(&T) -> usize) {
+fn counting_sort<T: Copy + Default>(
+    srcs: &[&[T]],
+    dst: &mut Vec<T>,
+    off: &mut Vec<u32>,
+    nb: usize,
+    key: impl Fn(&T) -> usize,
+) {
     off.clear();
     off.resize(nb + 1, 0);
-    for x in src {
-        off[key(x) + 1] += 1;
+    let mut n = 0usize;
+    for src in srcs {
+        n += src.len();
+        for x in src.iter() {
+            off[key(x) + 1] += 1;
+        }
     }
     for b in 0..nb {
         off[b + 1] += off[b];
     }
     dst.clear();
-    dst.reserve(src.len());
-    // SAFETY: every slot 0..src.len() is written exactly once below before being read.
-    unsafe { dst.set_len(src.len()) };
+    dst.resize(n, T::default());
     let mut cur: Vec<u32> = off[..nb].to_vec();
-    for x in src {
-        let k = key(x);
-        dst[cur[k] as usize] = *x;
-        cur[k] += 1;
+    for src in srcs {
+        for x in src.iter() {
+            let k = key(x);
+            dst[cur[k] as usize] = *x;
+            cur[k] += 1;
+        }
     }
 }
 

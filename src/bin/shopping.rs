@@ -1350,11 +1350,15 @@ fn run() -> Res<()> {
                     let mut w = Worker::new(ctx, ncat);
                     let mut evs: Vec<PEv> = Vec::new();
                     let mut cls: Vec<PCl> = Vec::new();
+                    let (mut evs2, mut cls2): (Vec<PEv>, Vec<PCl>) = (Vec::new(), Vec::new());
+                    let (mut eoff, mut coff): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
+                    let (mut tg, mut tso, mut tp) = (0u64, 0u64, 0u64);
                     loop {
                         let p = next.fetch_add(1, AtOrd::Relaxed);
                         if p >= NPART {
                             break;
                         }
+                        let ta = Instant::now();
                         evs.clear();
                         for o in pe_outs.iter() {
                             evs.extend_from_slice(&o[p]);
@@ -1363,27 +1367,54 @@ fn run() -> Res<()> {
                         for o in cl_outs.iter() {
                             cls.extend_from_slice(&o[p]);
                         }
-                        evs.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
-                        cls.sort_unstable_by_key(|c| ((c.person as u128) << 32) | c.ts as u128);
-                        let mut ci = 0usize;
-                        let mut i = 0usize;
-                        while i < evs.len() {
-                            let person = evs[i].person;
-                            let mut j = i + 1;
-                            while j < evs.len() && evs[j].person == person {
-                                j += 1;
+                        let tb = Instant::now();
+                        // group by person: counting sort into hash buckets (about one person
+                        // each), then sort each small bucket by (person, ts)
+                        let bbits = (evs.len() / 16).max(16).next_power_of_two().trailing_zeros();
+                        let nb = 1usize << bbits;
+                        let bucket = |k: u64| (k.wrapping_mul(0xA24B_AED4_963E_E407) >> (64 - bbits)) as usize;
+                        counting_sort(&evs, &mut evs2, &mut eoff, nb, |e| bucket(e.person));
+                        counting_sort(&cls, &mut cls2, &mut coff, nb, |c| bucket(c.person));
+                        let tc = Instant::now();
+                        tg += (tb - ta).as_nanos() as u64;
+                        tso += (tc - tb).as_nanos() as u64;
+                        for b in 0..nb {
+                            let es = &mut evs2[eoff[b] as usize..eoff[b + 1] as usize];
+                            if es.is_empty() {
+                                continue;
                             }
-                            while ci < cls.len() && cls[ci].person < person {
-                                ci += 1;
+                            if es.len() > 1 {
+                                es.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
                             }
-                            let mut cj = ci;
-                            while cj < cls.len() && cls[cj].person == person {
-                                cj += 1;
+                            let cs = &mut cls2[coff[b] as usize..coff[b + 1] as usize];
+                            if cs.len() > 1 {
+                                cs.sort_unstable_by_key(|c| ((c.person as u128) << 32) | c.ts as u128);
                             }
-                            w.person(person, &evs[i..j], &cls[ci..cj]);
-                            ci = cj;
-                            i = j;
+                            let (es, cs) = (&*es, &*cs);
+                            let mut ci = 0usize;
+                            let mut i = 0usize;
+                            while i < es.len() {
+                                let person = es[i].person;
+                                let mut j = i + 1;
+                                while j < es.len() && es[j].person == person {
+                                    j += 1;
+                                }
+                                while ci < cs.len() && cs[ci].person < person {
+                                    ci += 1;
+                                }
+                                let mut cj = ci;
+                                while cj < cs.len() && cs[cj].person == person {
+                                    cj += 1;
+                                }
+                                w.person(person, &es[i..j], &cs[ci..cj]);
+                                ci = cj;
+                                i = j;
+                            }
                         }
+                        tp += tc.elapsed().as_nanos() as u64;
+                    }
+                    if std::env::var_os("SS_TIMERS").is_some() {
+                        eprintln!("sessions thread: gather {} ms, sort {} ms, persons {} ms", tg / 1_000_000, tso / 1_000_000, tp / 1_000_000);
                     }
                     w
                 })
@@ -1576,6 +1607,29 @@ fn run() -> Res<()> {
     stage!(t0, "written");
     // all files are closed; exit without freeing the heap
     std::process::exit(0)
+}
+
+/// Stable counting sort of `src` into `dst` by `key` (< nb); `off[b]..off[b+1]` = bucket b.
+#[inline]
+fn counting_sort<T: Copy>(src: &[T], dst: &mut Vec<T>, off: &mut Vec<u32>, nb: usize, key: impl Fn(&T) -> usize) {
+    off.clear();
+    off.resize(nb + 1, 0);
+    for x in src {
+        off[key(x) + 1] += 1;
+    }
+    for b in 0..nb {
+        off[b + 1] += off[b];
+    }
+    dst.clear();
+    dst.reserve(src.len());
+    // SAFETY: every slot 0..src.len() is written exactly once below before being read.
+    unsafe { dst.set_len(src.len()) };
+    let mut cur: Vec<u32> = off[..nb].to_vec();
+    for x in src {
+        let k = key(x);
+        dst[cur[k] as usize] = *x;
+        cur[k] += 1;
+    }
 }
 
 /// Single-threaded component timings on ~300 MB of events held in memory (measurement only).

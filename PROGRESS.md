@@ -2,7 +2,7 @@
 
 Claude updates this after every milestone. The human reads it to see where things stand.
 
-Last updated: Sat Nov 21, 12:50 PM ET
+Last updated: Sat Nov 21, 12:35 PM ET
 
 ## Status
 | Milestone | State | Notes |
@@ -31,7 +31,8 @@ shopping image: fixtures 36/36 | dev: MATCH | check20: identical | crosscheck: 1
 | bc75a66 | reference image, bench20 (CPUS=8 MEM=8g) | 123 s | under 8g | single run, output MATCH vs native reference |
 | M2 v1 | shopping v1 (native, warm cache) | 5.0-5.7 s | 4.1 GB | single runs; first cold run 14 s |
 | M2 v1 | shopping v1 image (check20 run) | 6.6 s | | single run |
-| M3a | shopping, NCPU=8 native | 1.9-2.3 s | ~2.5 GB | runs vary 20%; image 3.7-5.0 s (Docker Desktop bind mount is slow here) |
+| M3a beb2920 | shopping, NCPU=8 native | 1.9-2.3 s | ~2.5 GB | runs vary 20%; image 3.7-5.0 s (Docker Desktop bind mount is slow here) |
+| M3b | + hand-written Parquet, SWAR timestamps, partitioned person join, bucketed grouping | 1.85 s median (min 1.53) | | stage_bench 5 runs NCPU=8 |
 
 ## Submissions
 | Time (ET) | Commit | Leaderboard result | Notes |

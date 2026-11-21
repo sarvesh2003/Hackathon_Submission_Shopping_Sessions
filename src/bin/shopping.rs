@@ -1968,12 +1968,12 @@ fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
     for _ in 0..3 {
         run("split v1", &mut || {
             let mut n = 0;
-            for_each_record::<7>(&data, |f| n += f[0].len() + f[6].len());
+            for_each_record::<7>(&data, |f| n += std::hint::black_box(f).iter().map(|x| x.len()).sum::<usize>());
             n
         });
         run("split v5 (line at a time)", &mut || {
             let mut n = 0;
-            for_each_record_v5::<7>(&data, |f| n += f[0].len() + f[6].len());
+            for_each_record_v5::<7>(&data, |f| n += std::hint::black_box(f).iter().map(|x| x.len()).sum::<usize>());
             n
         });
     }

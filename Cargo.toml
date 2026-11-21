@@ -22,7 +22,8 @@ hashbrown = "0.16"
 mimalloc = { version = "0.1", default-features = false }
 
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 panic = "abort"
 debug = false
 

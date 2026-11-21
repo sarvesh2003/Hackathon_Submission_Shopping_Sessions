@@ -356,7 +356,7 @@ fn days_in_month(y: i64, m: i64) -> i64 {
     }
 }
 
-#[inline]
+#[inline(always)]
 fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     let y = if m <= 2 { y - 1 } else { y };
     let era = if y >= 0 { y } else { y - 399 } / 400;
@@ -367,15 +367,46 @@ fn days_from_civil(y: i64, m: i64, d: i64) -> i64 {
     era * 146_097 + doe - 719_468
 }
 
+/// Per-thread cache of validated dates. Key = the exact 10 bytes "YYYY-MM-DD"; a hit returns
+/// the day number computed when those same bytes were validated.
+struct DateCache {
+    a: [u64; 32],
+    b: [u16; 32],
+    days: [i64; 32],
+    ok: [bool; 32],
+}
+
+impl DateCache {
+    fn new() -> Self {
+        DateCache { a: [0; 32], b: [0; 32], days: [0; 32], ok: [false; 32] }
+    }
+}
+
 /// F1 / F2 / F3 -> epoch ms. None = bad (including an F3 value too large for i64).
-#[inline]
 fn parse_ts(s: &[u8]) -> Option<i64> {
+    parse_ts_c(s, &mut DateCache::new())
+}
+
+/// `parse_ts` with a per-thread date cache.
+#[inline(always)]
+fn parse_ts_c(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     let n = s.len();
     if (n == 20 || n == 25) && s[4] == b'-' {
-        return parse_iso(s);
+        return parse_iso(s, dc);
     }
     if n == 0 {
         return None;
+    }
+    if n <= 18 {
+        // at most 18 digits cannot overflow i64
+        let mut v: i64 = 0;
+        let mut bad = 0u8;
+        for &c in s {
+            let d = c.wrapping_sub(b'0');
+            bad |= (d > 9) as u8;
+            v = v.wrapping_mul(10).wrapping_add(d as i64);
+        }
+        return if bad == 0 { Some(v) } else { None };
     }
     let mut v: i64 = 0;
     for &c in s {
@@ -404,31 +435,60 @@ fn swar_digits(x: u64, mask: u64) -> bool {
     (d & HI & mask) == (THREES & mask) && (d.wrapping_add(SIXES & mask) & HI & mask) == (THREES & mask)
 }
 
-/// F1 `YYYY-MM-DDTHH:MM:SSZ` or F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` (length 20 / 25, s[4] == '-').
-#[inline]
-fn parse_iso(s: &[u8]) -> Option<i64> {
+/// Validates "YYYY-MM-DD" (s[0..10]) and returns its day number.
+#[inline(never)]
+fn validate_date(s: &[u8]) -> Option<i64> {
     let a = le64(s, 0); // YYYY-MM-
-    let b = le64(s, 8); // DDTHH:MM
-    let c = le64(s, s.len() - 8); // last 8 bytes; holds ":SS" at a length-dependent offset
-    // separators: a[4]='-' a[7]='-'; b[2]='T' b[5]=':'
     const A_SEP_MASK: u64 = 0xFF00_00FF_0000_0000;
     const A_SEP: u64 = 0x2D00_002D_0000_0000;
-    const B_SEP_MASK: u64 = 0x0000_FF00_00FF_0000;
-    const B_SEP: u64 = 0x0000_3A00_0054_0000;
     const A_DIG: u64 = 0x00FF_FF00_FFFF_FFFF;
-    const B_DIG: u64 = 0xFFFF_00FF_FF00_FFFF;
-    if (a & A_SEP_MASK) != A_SEP
-        || (b & B_SEP_MASK) != B_SEP
-        || s[16] != b':'
-        || !swar_digits(a, A_DIG)
-        || !swar_digits(b, B_DIG)
-    {
+    if (a & A_SEP_MASK) != A_SEP || !swar_digits(a, A_DIG) {
         return None;
     }
-    let _ = c;
-    let s17 = s[17].wrapping_sub(b'0');
-    let s18 = s[18].wrapping_sub(b'0');
-    if s17 > 9 || s18 > 9 {
+    let day = d2(s, 8)?;
+    let da = a ^ 0x3030_3030_3030_3030;
+    let by = |i: u32| ((da >> (8 * i)) & 0xFF) as i64;
+    let year = by(0) * 1000 + by(1) * 100 + by(2) * 10 + by(3);
+    let month = by(5) * 10 + by(6);
+    if !(1..=12).contains(&month) || day < 1 || day > days_in_month(year, month) {
+        return None;
+    }
+    Some(days_from_civil(year, month, day))
+}
+
+#[inline(always)]
+fn date_days(s: &[u8], dc: &mut DateCache) -> Option<i64> {
+    let a = le64(s, 0);
+    let b = u16::from_le_bytes([s[8], s[9]]);
+    let e = ((s[8].wrapping_sub(b'0') as usize) * 10 + s[9].wrapping_sub(b'0') as usize) & 31;
+    if dc.ok[e] && dc.a[e] == a && dc.b[e] == b {
+        return Some(dc.days[e]);
+    }
+    let d = validate_date(s)?;
+    dc.a[e] = a;
+    dc.b[e] = b;
+    dc.days[e] = d;
+    dc.ok[e] = true;
+    Some(d)
+}
+
+/// F1 `YYYY-MM-DDTHH:MM:SSZ` or F2 `YYYY-MM-DDTHH:MM:SS+HH:MM` (length 20 / 25, s[4] == '-').
+#[inline(always)]
+fn parse_iso(s: &[u8], dc: &mut DateCache) -> Option<i64> {
+    let days = date_days(s, dc)?;
+    if s[10] != b'T' {
+        return None;
+    }
+    let t = le64(s, 11); // HH:MM:SS
+    if t & 0x0000_FF00_00FF_0000 != 0x0000_3A00_003A_0000 || !swar_digits(t, 0xFFFF_00FF_FF00_FFFF) {
+        return None;
+    }
+    let dt = t ^ 0x3030_3030_3030_3030;
+    let by = |i: u32| ((dt >> (8 * i)) & 0xFF) as i64;
+    let hour = by(0) * 10 + by(1);
+    let minute = by(3) * 10 + by(4);
+    let second = by(6) * 10 + by(7);
+    if hour > 23 || minute > 59 || second > 59 {
         return None;
     }
     let offset_ms = if s.len() == 20 {
@@ -452,25 +512,6 @@ fn parse_iso(s: &[u8]) -> Option<i64> {
         }
         sign * (oh * 3600 + om * 60) * 1000
     };
-    let da = a ^ 0x3030_3030_3030_3030;
-    let db = b ^ 0x3030_3030_3030_3030;
-    let by = |x: u64, i: u32| ((x >> (8 * i)) & 0xFF) as i64;
-    let year = by(da, 0) * 1000 + by(da, 1) * 100 + by(da, 2) * 10 + by(da, 3);
-    let month = by(da, 5) * 10 + by(da, 6);
-    let day = by(db, 0) * 10 + by(db, 1);
-    let hour = by(db, 3) * 10 + by(db, 4);
-    let minute = by(db, 6) * 10 + by(db, 7);
-    let second = (s17 * 10 + s18) as i64;
-    if !(1..=12).contains(&month)
-        || day < 1
-        || day > days_in_month(year, month)
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return None;
-    }
-    let days = days_from_civil(year, month, day);
     Some((days * 86_400 + hour * 3600 + minute * 60 + second) * 1000 - offset_ms)
 }
 
@@ -662,15 +703,15 @@ impl Ctx {
 
 /// Fields already split; event_id is non-empty.
 #[inline(always)]
-fn parse_event(f: &[&[u8]; 7], ctx: &Ctx) -> EvRec {
+fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> EvRec {
     let eid = id_key(f[0]);
-    let ingest = parse_ts(f[3]).unwrap_or(i64::MAX);
+    let ingest = parse_ts_c(f[3], dc).unwrap_or(i64::MAX);
     let mut rec = EvRec { eid, user: INVALID, ingest, ts: 0, pc: 0 };
     let (user, ts_raw, etype, product, price_raw) = (f[1], f[2], f[4], f[5], f[6]);
     if user.is_empty() || product.is_empty() {
         return rec;
     }
-    let ts = match parse_ts(ts_raw) {
+    let ts = match parse_ts_c(ts_raw, dc) {
         Some(t) if t >= ctx.ws && t < ctx.we => t,
         _ => return rec,
     };
@@ -687,19 +728,21 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx) -> EvRec {
     }
     rec.user = id_key(user);
     rec.ts = (ts - ctx.ws) as u32;
-    rec.pc = price | ((ctx.category(product) as u32) << 24);
+    // the category is only ever read for purchases (price > 0)
+    let cat = if price > 0 { ctx.category(product) } else { 0 };
+    rec.pc = price | ((cat as u32) << 24);
     rec
 }
 
 /// (user key, ts since click window start, click_id key, campaign) of a valid click.
 #[inline(always)]
-fn parse_click(f: &[&[u8]; 4], ctx: &Ctx) -> Option<(u64, u32, u64, u16)> {
+fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, dc: &mut DateCache) -> Option<(u64, u32, u64, u16)> {
     let (cid, user, camp, ts_raw) = (f[0], f[1], f[2], f[3]);
     if cid.is_empty() || user.is_empty() {
         return None;
     }
     let camp = ctx.campaign(camp)?;
-    let ts = parse_ts(ts_raw)?;
+    let ts = parse_ts_c(ts_raw, dc)?;
     if ts < ctx.cws || ts >= ctx.we {
         return None;
     }
@@ -729,12 +772,6 @@ struct PersonMap {
     parts: Vec<HashMap<u64, u64>>,
 }
 
-impl PersonMap {
-    #[inline]
-    fn person(&self, id: u64) -> u64 {
-        self.parts[part_of(id)].get(&id).copied().unwrap_or(id)
-    }
-}
 
 fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
     // dense indices: sorted unique keys
@@ -1189,8 +1226,10 @@ fn run() -> Res<()> {
     let next = AtomicUsize::new(0);
     let n_ev = event_chunks.len();
     let n_all = n_ev + click_chunks.len();
-    let cl_est = click_chunks.iter().map(|c| c.len()).sum::<usize>() / 50 / nthreads / NPART * 9 / 8 + 16;
-    let est = event_chunks.iter().map(|c| c.len()).sum::<usize>() / 90 / nthreads / NPART + 16;
+    // capacity guesses err high: measured ~77 B per event line and ~47 B per click line; a
+    // reserved-but-untouched tail costs nothing, a doubling costs a copy and fresh page faults
+    let cl_est = click_chunks.iter().map(|c| c.len()).sum::<usize>() / 40 / nthreads / NPART * 5 / 4 + 64;
+    let est = event_chunks.iter().map(|c| c.len()).sum::<usize>() / 64 / nthreads / NPART * 5 / 4 + 64;
     let outs: Vec<ParseOut> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..nthreads)
             .map(|w| {
@@ -1205,6 +1244,7 @@ fn run() -> Res<()> {
                         ev: (0..NPART).map(|_| Vec::with_capacity(est)).collect(),
                         cl: (0..NPART).map(|_| Vec::with_capacity(cl_est)).collect(),
                     };
+                    let mut dc = DateCache::new();
                     loop {
                         let i = next.fetch_add(1, AtOrd::Relaxed);
                         if i >= n_all {
@@ -1213,14 +1253,14 @@ fn run() -> Res<()> {
                         if i < n_ev {
                             for_each_record::<7>(event_chunks[i], |f| {
                                 if !f[0].is_empty() {
-                                    let r = parse_event(f, ctx);
+                                    let r = parse_event(f, ctx, &mut dc);
                                     out.ev[part_of(r.eid)].push(r);
                                 }
                             });
                         } else {
                             // by user partition; the person is resolved later (partitioned join)
                             for_each_record::<4>(click_chunks[i - n_ev], |f| {
-                                if let Some((user, ts, cid, camp)) = parse_click(f, ctx) {
+                                if let Some((user, ts, cid, camp)) = parse_click(f, ctx, &mut dc) {
                                     out.cl[part_of(user)].push(PCl { person: user, cid, ts, camp });
                                 }
                             });
@@ -1238,7 +1278,7 @@ fn run() -> Res<()> {
     // ---- dedup events per event_id partition, scatter survivors by person
     let next = AtomicUsize::new(0);
     let n_ev_recs: usize = outs.iter().map(|o| o.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let pe_est = n_ev_recs / nthreads / NPART * 9 / 8 + 16;
+    let pe_est = n_ev_recs / nthreads / NPART * 3 / 2 + 64;
     let ue_outs: Vec<Vec<Vec<PEv>>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
@@ -1310,7 +1350,7 @@ fn run() -> Res<()> {
     // ---- resolve persons: user partition q only needs the small map pmap.parts[q]
     let next = AtomicUsize::new(0);
     let n_cl: usize = cu_outs.iter().map(|o| o.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let pc_est = n_cl / nthreads / NPART * 9 / 8 + 16;
+    let pc_est = n_cl / nthreads / NPART * 3 / 2 + 64;
     let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
@@ -1707,11 +1747,12 @@ fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
         for_each_record::<7>(&data, |f| n += ctx.category(f[5]) as usize);
         n
     });
+    let mut dc = DateCache::new();
     run("full parse_event", &mut || {
         let mut n = 0u64;
         for_each_record::<7>(&data, |f| {
             if !f[0].is_empty() {
-                let r = parse_event(f, ctx);
+                let r = parse_event(f, ctx, &mut dc);
                 n = n.wrapping_add(r.eid ^ r.user ^ r.pc as u64);
             }
         });
@@ -1721,7 +1762,7 @@ fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
         let mut parts: Vec<Vec<EvRec>> = (0..NPART).map(|_| Vec::with_capacity(lines / NPART + 64)).collect();
         for_each_record::<7>(&data, |f| {
             if !f[0].is_empty() {
-                let r = parse_event(f, ctx);
+                let r = parse_event(f, ctx, &mut dc);
                 parts[part_of(r.eid)].push(r);
             }
         });
@@ -1901,6 +1942,7 @@ mod tests {
             rng
         };
         let mut checked = 0u64;
+        let mut shared = DateCache::new();
         for t in templates {
             assert_eq!(parse_ts(t), ref_parse_ts(t), "{:?}", String::from_utf8_lossy(t));
             for _ in 0..400_000 {
@@ -1910,6 +1952,7 @@ mod tests {
                     v[i] = alphabet[(next() as usize) % alphabet.len()];
                 }
                 assert_eq!(parse_ts(&v), ref_parse_ts(&v), "{:?}", String::from_utf8_lossy(&v));
+                assert_eq!(parse_ts_c(&v, &mut shared), ref_parse_ts(&v), "cached {:?}", String::from_utf8_lossy(&v));
                 checked += 1;
             }
         }
@@ -1922,6 +1965,8 @@ mod tests {
                         let f2 = format!("{y:04}-{m:02}-{d:02}T{hms}+05:30");
                         assert_eq!(parse_ts(f1.as_bytes()), ref_parse_ts(f1.as_bytes()), "{f1}");
                         assert_eq!(parse_ts(f2.as_bytes()), ref_parse_ts(f2.as_bytes()), "{f2}");
+                        assert_eq!(parse_ts_c(f1.as_bytes(), &mut shared), ref_parse_ts(f1.as_bytes()), "cached {f1}");
+                        assert_eq!(parse_ts_c(f2.as_bytes(), &mut shared), ref_parse_ts(f2.as_bytes()), "cached {f2}");
                         checked += 2;
                     }
                 }

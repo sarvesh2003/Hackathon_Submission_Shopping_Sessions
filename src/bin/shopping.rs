@@ -1313,7 +1313,9 @@ fn run() -> Res<()> {
                 s.spawn(move || {
                     let mut parts: Vec<Vec<PEv>> =
                         (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
-                    let mut table: Vec<u32> = Vec::new();
+                    let mut table: Vec<u64> = Vec::new();
+                    let mut alive: Vec<u64> = Vec::new();
+                    let mut base: Vec<u32> = Vec::with_capacity(outs.len());
                     let mut srcs: Vec<&[EvRec]> = Vec::with_capacity(outs.len());
                     loop {
                         let p = next.fetch_add(1, AtOrd::Relaxed);
@@ -1328,40 +1330,66 @@ fn run() -> Res<()> {
                         if n == 0 {
                             continue;
                         }
+                        // a record is addressed as (source thread << 24 | index); its dense number
+                        // g = base[thread] + index selects its bit in `alive`
                         let rec = |id: u32| -> &EvRec { &srcs[(id >> 24) as usize][(id & 0xFF_FFFF) as usize] };
+                        base.clear();
+                        let mut acc = 0u32;
+                        for v in srcs.iter() {
+                            base.push(acc);
+                            acc += v.len() as u32;
+                        }
+                        let dense = |id: u32| (base[(id >> 24) as usize] + (id & 0xFF_FFFF)) as usize;
+                        alive.clear();
+                        alive.resize(n.div_ceil(64), 0);
                         let bits = (2 * n).next_power_of_two().trailing_zeros().max(4);
                         let mask = (1usize << bits) - 1;
+                        // slot = (low 32 bits of event_id) << 32 | id; EMPTY = u64::MAX
+                        const EMPTY: u64 = u64::MAX;
                         table.clear();
-                        table.resize(1 << bits, u32::MAX);
+                        table.resize(1 << bits, EMPTY);
                         for (t, src) in srcs.iter().enumerate() {
                             for (i, cur) in src.iter().enumerate() {
                                 let id = ((t as u32) << 24) | i as u32;
                                 let k = cur.eid;
+                                let tag = (k as u32 as u64) << 32;
                                 let mut h = (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> (64 - bits)) as usize;
                                 loop {
                                     let s = table[h];
-                                    if s == u32::MAX {
-                                        table[h] = id;
+                                    if s == EMPTY {
+                                        table[h] = tag | id as u64;
+                                        let g = dense(id);
+                                        alive[g >> 6] |= 1u64 << (g & 63);
                                         break;
                                     }
-                                    let r = rec(s);
-                                    if r.eid == k {
-                                        if cur.ingest < r.ingest {
-                                            table[h] = id;
+                                    if s & 0xFFFF_FFFF_0000_0000 == tag {
+                                        let old = s as u32;
+                                        let r = rec(old);
+                                        if r.eid == k {
+                                            // keep the smallest ingest_ts; on a tie, the first seen
+                                            if cur.ingest < r.ingest {
+                                                table[h] = tag | id as u64;
+                                                let go = dense(old);
+                                                alive[go >> 6] &= !(1u64 << (go & 63));
+                                                let g = dense(id);
+                                                alive[g >> 6] |= 1u64 << (g & 63);
+                                            }
+                                            break;
                                         }
-                                        break;
                                     }
                                     h = (h + 1) & mask;
                                 }
                             }
                         }
-                        for &s in table.iter() {
-                            if s != u32::MAX {
-                                let r = rec(s);
-                                if r.user != INVALID {
+                        // emit survivors in memory order
+                        let mut g = 0usize;
+                        for src in srcs.iter() {
+                            for r in src.iter() {
+                                if (alive[g >> 6] >> (g & 63)) & 1 != 0 && r.user != INVALID {
                                     // person resolved in the next pass (partitioned join)
                                     parts[part_of(r.user)].push(PEv { person: r.user, ts: r.ts, pc: r.pc });
                                 }
+                                g += 1;
                             }
                         }
                     }

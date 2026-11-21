@@ -17,6 +17,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 FROM debian:bookworm-slim@sha256:734a72b3d6142a71993b4bc580ca01d8ca687f77a2c422d96a961d3376b179bc
 ARG BIN=shopping
 COPY --from=build /out/run /app/run
+COPY scripts/diag.sh /app/diag.sh
 ENV BIN=${BIN}
 USER 1000:1000
-CMD ["/app/run"]
+CMD ["/app/diag.sh"]

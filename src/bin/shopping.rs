@@ -323,6 +323,123 @@ fn for_each_record<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&'a 
     }
 }
 
+/// (commas, newlines, quotes) masks of 64 bytes; bit i <=> p[i].
+#[cfg(target_feature = "avx2")]
+#[inline(always)]
+fn masks3(p: &[u8; 64]) -> (u64, u64, u64) {
+    use std::arch::x86_64::*;
+    // SAFETY: avx2 is enabled at compile time; loads are unaligned and within the 64-byte array.
+    unsafe {
+        let a = _mm256_loadu_si256(p.as_ptr() as *const __m256i);
+        let b = _mm256_loadu_si256(p.as_ptr().add(32) as *const __m256i);
+        let m = |x: __m256i, y: __m256i| {
+            (_mm256_movemask_epi8(x) as u32 as u64) | ((_mm256_movemask_epi8(y) as u32 as u64) << 32)
+        };
+        let vc = _mm256_set1_epi8(b',' as i8);
+        let vn = _mm256_set1_epi8(b'\n' as i8);
+        let vq = _mm256_set1_epi8(b'"' as i8);
+        (
+            m(_mm256_cmpeq_epi8(a, vc), _mm256_cmpeq_epi8(b, vc)),
+            m(_mm256_cmpeq_epi8(a, vn), _mm256_cmpeq_epi8(b, vn)),
+            m(_mm256_cmpeq_epi8(a, vq), _mm256_cmpeq_epi8(b, vq)),
+        )
+    }
+}
+
+#[cfg(not(target_feature = "avx2"))]
+#[inline(always)]
+fn masks3(p: &[u8; 64]) -> (u64, u64, u64) {
+    let (mut c, mut n, mut q) = (0u64, 0u64, 0u64);
+    for (i, &b) in p.iter().enumerate() {
+        c |= ((b == b',') as u64) << i;
+        n |= ((b == b'\n') as u64) << i;
+        q |= ((b == b'"') as u64) << i;
+    }
+    (c, n, q)
+}
+
+/// Same contract as `for_each_record`, one whole line per step (lines < 128 bytes): a line is
+/// well-formed iff it has N-1 commas and its quotes are exactly the first and last byte of some
+/// fields (each such field at least 2 bytes long), checked for all fields at once on 128-bit
+/// masks. Longer lines and the last 128 bytes of the chunk go through `split_fields`.
+#[inline(always)]
+fn for_each_record_v5<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&'a [u8]; N])) {
+    let len = chunk.len();
+    let mut pos = 0usize;
+    let mut fields: [&'a [u8]; N] = [&[]; N];
+    while pos + 128 <= len {
+        let (c0, n0, q0) = masks3(chunk[pos..pos + 64].try_into().unwrap());
+        let (nl, c, q): (usize, u128, u128) = if n0 != 0 {
+            let nl = n0.trailing_zeros() as usize;
+            let m = (1u64 << nl) - 1;
+            (nl, (c0 & m) as u128, (q0 & m) as u128)
+        } else {
+            let (c1, n1, q1) = masks3(chunk[pos + 64..pos + 128].try_into().unwrap());
+            if n1 == 0 {
+                // a line of 128 bytes or more: exact slow path
+                let end = match memchr::memchr(b'\n', &chunk[pos + 128..]) {
+                    Some(d) => pos + 128 + d,
+                    None => len,
+                };
+                if split_fields(&chunk[pos..end], &mut fields) {
+                    f(&fields);
+                }
+                pos = end + 1;
+                continue;
+            }
+            let nl1 = n1.trailing_zeros() as usize;
+            let m1 = (1u64 << nl1) - 1;
+            (64 + nl1, c0 as u128 | (((c1 & m1) as u128) << 64), q0 as u128 | (((q1 & m1) as u128) << 64))
+        };
+        let ls = pos;
+        pos += nl + 1;
+        if nl == 0 || c.count_ones() != (N - 1) as u32 {
+            continue; // empty line or wrong field count
+        }
+        let term = c | (1u128 << nl); // one past the end of every field
+        let starts = 1u128 | (c << 1); // first byte of every field
+        let ends = term >> 1; // last byte of every non-empty field
+        let open_q = q & starts;
+        if q != 0 {
+            let close_q = q & ends;
+            if q != (open_q | close_q)
+                || (open_q & close_q) != 0
+                || open_q.count_ones() != close_q.count_ones()
+                || (close_q.wrapping_sub(open_q) & term) != 0
+            {
+                continue;
+            }
+        }
+        let line = &chunk[ls..ls + nl];
+        let mut cm = c;
+        let mut s = 0usize;
+        for (k, slot) in fields.iter_mut().enumerate() {
+            let e = if k + 1 < N {
+                let e = cm.trailing_zeros() as usize;
+                cm &= cm - 1;
+                e
+            } else {
+                nl
+            };
+            let qk = ((open_q >> s) & 1) as usize;
+            *slot = &line[s + qk..e - qk];
+            s = e + 1;
+        }
+        f(&fields);
+    }
+    // the last < 128 bytes (and a final line without '\n'): exact slow path
+    while pos < len {
+        let end = match memchr::memchr(b'\n', &chunk[pos..]) {
+            Some(d) => pos + d,
+            None => len,
+        };
+        if split_fields(&chunk[pos..end], &mut fields) {
+            f(&fields);
+        }
+        pos = end + 1;
+    }
+}
+
 // ======================================================================= timestamps
 
 #[inline]
@@ -783,7 +900,7 @@ fn parse_links(link_chunks: &[&[u8]]) -> Vec<Vec<(u64, u64)>> {
         .par_iter()
         .map(|chunk| {
             let mut v = Vec::new();
-            for_each_record::<2>(chunk, |f| {
+            for_each_record_v5::<2>(chunk, |f| {
                 if !f[0].is_empty() && !f[1].is_empty() {
                     v.push((id_key(f[0]), id_key(f[1])));
                 }
@@ -1278,7 +1395,7 @@ fn run() -> Res<()> {
                             break;
                         }
                         if i < n_ev {
-                            for_each_record::<7>(event_chunks[i], |f| {
+                            for_each_record_v5::<7>(event_chunks[i], |f| {
                                 if !f[0].is_empty() {
                                     let r = parse_event(f, ctx, &mut dc);
                                     out.ev[part_of(r.eid)].push(r);
@@ -1286,7 +1403,7 @@ fn run() -> Res<()> {
                             });
                         } else {
                             // by user partition; the person is resolved later (partitioned join)
-                            for_each_record::<4>(click_chunks[i - n_ev], |f| {
+                            for_each_record_v5::<4>(click_chunks[i - n_ev], |f| {
                                 if let Some((user, ts, cid, camp)) = parse_click(f, ctx, &mut dc) {
                                     out.cl[part_of(user)].push(PCl { person: user, cid, ts, camp });
                                 }
@@ -1797,6 +1914,18 @@ fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
         );
     };
     run("memchr newlines", &mut || memchr::memchr_iter(b'\n', &data).count());
+    for _ in 0..3 {
+        run("split v1", &mut || {
+            let mut n = 0;
+            for_each_record::<7>(&data, |f| n += f[0].len() + f[6].len());
+            n
+        });
+        run("split v5 (line at a time)", &mut || {
+            let mut n = 0;
+            for_each_record_v5::<7>(&data, |f| n += f[0].len() + f[6].len());
+            n
+        });
+    }
     run("split 7 fields", &mut || {
         let mut n = 0;
         for_each_record::<7>(&data, |f| n += f[0].len());
@@ -1990,13 +2119,26 @@ mod tests {
             rng ^= rng << 17;
             rng
         };
-        for round in 0..20_000 {
-            let n = (next() % 300) as usize;
+        // 7-field lines need about 6 commas per line: commas common, newlines rarer
+        let alpha7: &[u8] = b"aaabbcc,,,,,,\"\"\n ";
+        for round in 0..100_000 {
+            let n = (next() % 700) as usize;
             let chunk: Vec<u8> = (0..n).map(|_| alphabet[(next() as usize) % alphabet.len()]).collect();
             let want = split_reference::<3>(&chunk);
             let mut got1 = Vec::new();
             for_each_record::<3>(&chunk, |f| got1.push(f.iter().map(|v| v.to_vec()).collect::<Vec<_>>()));
             assert_eq!(got1, want, "v1 round {round}: {:?}", String::from_utf8_lossy(&chunk));
+            let mut got5 = Vec::new();
+            for_each_record_v5::<3>(&chunk, |f| got5.push(f.iter().map(|v| v.to_vec()).collect::<Vec<_>>()));
+            assert_eq!(got5, want, "v5 round {round}: {:?}", String::from_utf8_lossy(&chunk));
+            let chunk7: Vec<u8> = (0..n * 2).map(|_| alpha7[(next() as usize) % alpha7.len()]).collect();
+            let want7 = split_reference::<7>(&chunk7);
+            let mut got7 = Vec::new();
+            for_each_record_v5::<7>(&chunk7, |f| got7.push(f.iter().map(|v| v.to_vec()).collect::<Vec<_>>()));
+            assert_eq!(got7, want7, "v5/7 round {round}: {:?}", String::from_utf8_lossy(&chunk7));
+            let mut got71 = Vec::new();
+            for_each_record::<7>(&chunk7, |f| got71.push(f.iter().map(|v| v.to_vec()).collect::<Vec<_>>()));
+            assert_eq!(got71, want7, "v1/7 round {round}: {:?}", String::from_utf8_lossy(&chunk7));
         }
     }
 

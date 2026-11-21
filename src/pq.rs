@@ -1,6 +1,8 @@
 //! Minimal hand-written Parquet writer: one row group, one PLAIN data page (v1) per column,
 //! no compression, no statistics, no dictionary. Supports exactly what our two tables need:
-//! REQUIRED/OPTIONAL BYTE_ARRAY (UTF8 string), REQUIRED INT32 (DATE), REQUIRED INT64.
+//! REQUIRED/OPTIONAL BYTE_ARRAY (UTF8 string), REQUIRED INT32 (plain or DATE), REQUIRED INT64.
+//! Pages are streamed to the writer; numeric pages are written straight from the value arrays
+//! (PLAIN encoding is little-endian, which is the in-memory layout on x86_64).
 
 use std::io::Write;
 
@@ -11,7 +13,16 @@ pub enum Column<'a> {
     /// as in `Str`
     OptStr { name: &'a str, data: &'a [u8], ends: &'a [u32], present: &'a [bool] },
     Date { name: &'a str, values: &'a [i32] },
+    I32 { name: &'a str, values: &'a [i32] },
     I64 { name: &'a str, values: &'a [i64] },
+}
+
+#[cfg(not(target_endian = "little"))]
+compile_error!("pq.rs writes numeric pages from memory and assumes little-endian");
+
+fn as_bytes<T>(v: &[T]) -> &[u8] {
+    // SAFETY: plain integers; any byte view of them is valid.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
 }
 
 // parquet enums
@@ -112,13 +123,14 @@ impl<'a> Column<'a> {
             Column::Str { name, .. }
             | Column::OptStr { name, .. }
             | Column::Date { name, .. }
+            | Column::I32 { name, .. }
             | Column::I64 { name, .. } => name,
         }
     }
     fn ptype(&self) -> i32 {
         match self {
             Column::Str { .. } | Column::OptStr { .. } => T_BYTE_ARRAY,
-            Column::Date { .. } => T_INT32,
+            Column::Date { .. } | Column::I32 { .. } => T_INT32,
             Column::I64 { .. } => T_INT64,
         }
     }
@@ -153,18 +165,7 @@ fn page_body(col: &Column, out: &mut Vec<u8>) {
             out.extend_from_slice(&lv);
             plain_strings(data, ends, out);
         }
-        Column::Date { values, .. } => {
-            out.reserve(values.len() * 4);
-            for v in values.iter() {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
-        Column::I64 { values, .. } => {
-            out.reserve(values.len() * 8);
-            for v in values.iter() {
-                out.extend_from_slice(&v.to_le_bytes());
-            }
-        }
+        Column::Date { .. } | Column::I32 { .. } | Column::I64 { .. } => {}
     }
 }
 
@@ -179,10 +180,10 @@ fn plain_strings(data: &[u8], ends: &[u32], out: &mut Vec<u8>) {
     }
 }
 
-/// Writes a complete Parquet file with `rows` rows to `w`.
+/// Writes a complete Parquet file with `rows` rows to `w` (pages streamed, no full-file buffer).
 pub fn write_file<W: Write>(w: &mut W, rows: usize, cols: &[Column]) -> std::io::Result<()> {
-    let mut file: Vec<u8> = Vec::new();
-    file.extend_from_slice(b"PAR1");
+    w.write_all(b"PAR1")?;
+    let mut pos: i64 = 4;
     struct ChunkMeta {
         offset: i64,
         size: i64,
@@ -193,10 +194,15 @@ pub fn write_file<W: Write>(w: &mut W, rows: usize, cols: &[Column]) -> std::io:
         for col in cols {
             body.clear();
             page_body(col, &mut body);
+            let payload: &[u8] = match col {
+                Column::Date { values, .. } | Column::I32 { values, .. } => as_bytes(values),
+                Column::I64 { values, .. } => as_bytes(values),
+                _ => &body,
+            };
             let mut h = Thrift::new();
             h.i32f(1, 0); // DATA_PAGE
-            h.i32f(2, body.len() as i32);
-            h.i32f(3, body.len() as i32);
+            h.i32f(2, payload.len() as i32);
+            h.i32f(3, payload.len() as i32);
             h.begin_struct_field(5); // DataPageHeader
             h.i32f(1, rows as i32);
             h.i32f(2, ENC_PLAIN);
@@ -204,10 +210,11 @@ pub fn write_file<W: Write>(w: &mut W, rows: usize, cols: &[Column]) -> std::io:
             h.i32f(4, ENC_RLE);
             h.end_struct();
             h.buf.push(0); // end PageHeader
-            let offset = file.len() as i64;
-            file.extend_from_slice(&h.buf);
-            file.extend_from_slice(&body);
-            metas.push(ChunkMeta { offset, size: (h.buf.len() + body.len()) as i64 });
+            w.write_all(&h.buf)?;
+            w.write_all(payload)?;
+            let size = (h.buf.len() + payload.len()) as i64;
+            metas.push(ChunkMeta { offset: pos, size });
+            pos += size;
         }
     }
 
@@ -240,7 +247,7 @@ pub fn write_file<W: Write>(w: &mut W, rows: usize, cols: &[Column]) -> std::io:
                 m.end_struct();
                 m.end_struct();
             }
-            Column::I64 { .. } => {}
+            Column::I32 { .. } | Column::I64 { .. } => {}
         }
         m.end_struct();
     }
@@ -278,8 +285,7 @@ pub fn write_file<W: Write>(w: &mut W, rows: usize, cols: &[Column]) -> std::io:
     m.binf(6, b"shopping-sessions");
     m.buf.push(0); // end FileMetaData
 
-    file.extend_from_slice(&m.buf);
-    file.extend_from_slice(&(m.buf.len() as u32).to_le_bytes());
-    file.extend_from_slice(b"PAR1");
-    w.write_all(&file)
+    w.write_all(&m.buf)?;
+    w.write_all(&(m.buf.len() as u32).to_le_bytes())?;
+    w.write_all(b"PAR1")
 }

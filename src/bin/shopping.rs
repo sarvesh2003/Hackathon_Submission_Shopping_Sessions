@@ -1809,7 +1809,7 @@ fn run() -> Res<()> {
     let cd_job_hw = || -> Res<()> {
         let (mut cname, mut cname_end) = (Vec::new(), Vec::new());
         let (mut chan, mut chan_end) = (Vec::new(), Vec::new());
-        let (mut day, mut sess, mut purch, mut rev, mut asst) =
+        let (mut day, mut sess, mut purch, mut rev, mut asst): (Vec<i32>, Vec<i32>, Vec<i32>, Vec<i64>, Vec<i32>) =
             (Vec::new(), Vec::new(), Vec::new(), Vec::new(), Vec::new());
         for c in 0..=ctx.ncamp {
             for d in 0..ndays {
@@ -1824,20 +1824,20 @@ fn run() -> Res<()> {
                 chan.extend_from_slice(channel);
                 chan_end.push(chan.len() as u32);
                 day.push((ws_day + d as i64) as i32);
-                sess.push(a.sessions as i64);
-                purch.push(a.purchasing as i64);
+                sess.push(a.sessions as i32);
+                purch.push(a.purchasing as i32);
                 rev.push(a.revenue as i64);
-                asst.push(a.assisted as i64);
+                asst.push(a.assisted as i32);
             }
         }
         let cols = [
             pq::Column::Str { name: "campaign_id", data: &cname, ends: &cname_end },
             pq::Column::Str { name: "channel", data: &chan, ends: &chan_end },
             pq::Column::Date { name: "day", values: &day },
-            pq::Column::I64 { name: "sessions", values: &sess },
-            pq::Column::I64 { name: "purchasing_sessions", values: &purch },
+            pq::Column::I32 { name: "sessions", values: &sess },
+            pq::Column::I32 { name: "purchasing_sessions", values: &purch },
             pq::Column::I64 { name: "revenue_cents", values: &rev },
-            pq::Column::I64 { name: "assisted_sessions", values: &asst },
+            pq::Column::I32 { name: "assisted_sessions", values: &asst },
         ];
         let mut f = fs::File::create(cd_dir.join("part-0.parquet"))?;
         pq::write_file(&mut f, day.len(), &cols)?;
@@ -1853,8 +1853,8 @@ fn run() -> Res<()> {
             id_bytes(r.person, &mut user);
             user_end.push(user.len() as u32);
             day.push((ws_day + r.day as i64) as i32);
-            sess.push(r.sessions as i64);
-            evs.push(r.events as i64);
+            sess.push(r.sessions as i32);
+            evs.push(r.events as i32);
             rev.push(r.revenue as i64);
             if r.top >= 0 {
                 top.extend_from_slice(cat_names[r.top as usize]);
@@ -1867,8 +1867,8 @@ fn run() -> Res<()> {
         let cols = [
             pq::Column::Str { name: "user_id", data: &user, ends: &user_end },
             pq::Column::Date { name: "day", values: &day },
-            pq::Column::I64 { name: "sessions", values: &sess },
-            pq::Column::I64 { name: "events", values: &evs },
+            pq::Column::I32 { name: "sessions", values: &sess },
+            pq::Column::I32 { name: "events", values: &evs },
             pq::Column::I64 { name: "revenue_cents", values: &rev },
             pq::Column::OptStr { name: "top_category", data: &top, ends: &top_end, present: &present },
         ];

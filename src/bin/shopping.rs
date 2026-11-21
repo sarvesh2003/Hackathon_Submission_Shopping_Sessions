@@ -781,6 +781,32 @@ fn map_files(paths: &[PathBuf]) -> Res<Vec<Mmap>> {
         .collect()
 }
 
+/// The non-empty files of `paths`, in order (the same files and order as `map_files`).
+fn open_nonempty(paths: &[PathBuf]) -> Res<Vec<fs::File>> {
+    let mut out = Vec::new();
+    for p in paths {
+        let f = fs::File::open(p)?;
+        if f.metadata()?.len() > 0 {
+            out.push(f);
+        }
+    }
+    Ok(out)
+}
+
+/// (file index, byte offset, length) of every chunk, from chunks cut out of `maps`.
+fn chunk_locations(maps: &[Mmap], chunks: &[&[u8]]) -> Vec<(usize, u64, usize)> {
+    let mut out = Vec::with_capacity(chunks.len());
+    let mut fi = 0usize;
+    for c in chunks {
+        let p = c.as_ptr() as usize;
+        while !(p >= maps[fi].as_ptr() as usize && p < maps[fi].as_ptr() as usize + maps[fi].len()) {
+            fi += 1;
+        }
+        out.push((fi, (p - maps[fi].as_ptr() as usize) as u64, c.len()));
+    }
+    out
+}
+
 /// Splits every file (header line skipped) into chunks of whole lines.
 fn chunk_files(maps: &[Mmap], target: usize) -> Vec<&[u8]> {
     let mut chunks = Vec::new();
@@ -1492,6 +1518,13 @@ fn run() -> Res<()> {
     let link_chunks = chunk_files(&link_maps, CHUNK_BYTES);
     let event_chunks = chunk_files(&event_maps, CHUNK_BYTES);
     let click_chunks = chunk_files(&click_maps, CHUNK_BYTES);
+    // Workers read chunks with pread into a reused per-thread buffer instead of touching the
+    // mappings: no page faults on the input, no page-table teardown, and the bytes are hot in
+    // cache when parsed. The mappings are only used to find line boundaries.
+    let event_files = open_nonempty(&list_csv(&data_dir.join("events"))?)?;
+    let click_files = open_nonempty(&list_csv(&data_dir.join("clicks"))?)?;
+    let event_locs = chunk_locations(&event_maps, &event_chunks);
+    let click_locs = chunk_locations(&click_maps, &click_chunks);
     stage!(t0, "mapped inputs");
 
     if std::env::var_os("SS_SCAN_ONLY").is_some() {
@@ -1532,7 +1565,8 @@ fn run() -> Res<()> {
         let w = bc.index();
         {
                 let (gate, next, ctx, link_pairs) = (&gate, &next, &ctx, &link_pairs);
-                let (event_chunks, click_chunks) = (&event_chunks, &click_chunks);
+                let (event_locs, click_locs) = (&event_locs, &click_locs);
+                let (event_files, click_files) = (&event_files, &click_files);
                 (move || {
                     if w == 0 {
                         gate.set(uf_pool.install(|| build_person_map(link_pairs)));
@@ -1543,13 +1577,24 @@ fn run() -> Res<()> {
                         cl: (0..NPART).map(|_| Vec::with_capacity(cl_est)).collect(),
                     };
                     let mut dc = DateCache::new();
+                    let mut buf: Vec<u8> = vec![0; CHUNK_BYTES + (64 << 10)];
+                    let read_chunk = |buf: &mut Vec<u8>, files: &[fs::File], loc: (usize, u64, usize)| -> usize {
+                        use std::os::unix::fs::FileExt;
+                        let (fi, off, len) = loc;
+                        if buf.len() < len {
+                            buf.resize(len, 0);
+                        }
+                        files[fi].read_exact_at(&mut buf[..len], off).expect("reading an input chunk");
+                        len
+                    };
                     loop {
                         let i = next.fetch_add(1, AtOrd::Relaxed);
                         if i >= n_all {
                             break;
                         }
                         if i < n_ev {
-                            for_each_record_v5::<7>(event_chunks[i], |f| {
+                            let len = read_chunk(&mut buf, event_files, event_locs[i]);
+                            for_each_record_v5::<7>(&buf[..len], |f| {
                                 if !f[0].is_empty() {
                                     let r = parse_event(f, ctx, &mut dc);
                                     out.ev[part_of(r.eid)].push(r);
@@ -1557,7 +1602,8 @@ fn run() -> Res<()> {
                             });
                         } else {
                             // by user partition; the person is resolved later (partitioned join)
-                            for_each_record_v5::<4>(click_chunks[i - n_ev], |f| {
+                            let len = read_chunk(&mut buf, click_files, click_locs[i - n_ev]);
+                            for_each_record_v5::<4>(&buf[..len], |f| {
                                 if let Some((user, ts, cid, camp)) = parse_click(f, ctx, &mut dc) {
                                     out.cl[part_of(user)].push(PCl { person: user, cid, ts, camp });
                                 }

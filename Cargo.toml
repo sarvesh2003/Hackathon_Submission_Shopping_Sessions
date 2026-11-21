@@ -25,3 +25,7 @@ mimalloc = { version = "0.1", default-features = false }
 lto = "thin"
 panic = "abort"
 debug = false
+
+[profile.profiling]
+inherits = "release"
+debug = "line-tables-only"

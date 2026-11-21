@@ -397,6 +397,16 @@ fn parse_ts_c(s: &[u8], dc: &mut DateCache) -> Option<i64> {
     if n == 0 {
         return None;
     }
+    if n == 13 {
+        // the usual F3 width: 8 + 4 + 1 digits with SWAR
+        let hi = le64(s, 0);
+        let mid = u32::from_le_bytes([s[8], s[9], s[10], s[11]]) as u64;
+        let lo = s[12].wrapping_sub(b'0');
+        if !swar_digits(hi, u64::MAX) || !swar_digits(mid, 0xFFFF_FFFF) || lo > 9 {
+            return None;
+        }
+        return Some((swar8(hi) * 100_000 + swar4(mid) * 10 + lo as u64) as i64);
+    }
     if n <= 18 {
         // at most 18 digits cannot overflow i64
         let mut v: i64 = 0;
@@ -422,6 +432,23 @@ fn parse_ts_c(s: &[u8], dc: &mut DateCache) -> Option<i64> {
 #[inline(always)]
 fn le64(s: &[u8], i: usize) -> u64 {
     u64::from_le_bytes(s[i..i + 8].try_into().unwrap())
+}
+
+/// Value of 8 ASCII digits (validated by the caller), first digit in the lowest byte.
+#[inline(always)]
+fn swar8(x: u64) -> u64 {
+    let d = x - 0x3030_3030_3030_3030;
+    let p2 = (d.wrapping_mul(10 << 8 | 1) >> 8) & 0x00FF_00FF_00FF_00FF;
+    let p4 = (p2.wrapping_mul(100 << 16 | 1) >> 16) & 0x0000_FFFF_0000_FFFF;
+    p4.wrapping_mul(10_000 << 32 | 1) >> 32
+}
+
+/// Value of 4 ASCII digits in the low 4 bytes (validated by the caller).
+#[inline(always)]
+fn swar4(x: u64) -> u64 {
+    let d = x - 0x3030_3030;
+    let p2 = (d.wrapping_mul(10 << 8 | 1) >> 8) & 0x00FF_00FF;
+    (p2.wrapping_mul(100 << 16 | 1) >> 16) & 0xFFFF
 }
 
 /// True if every byte selected by `mask` (0xFF per byte) is an ASCII digit.
@@ -766,45 +793,14 @@ fn parse_links(link_chunks: &[&[u8]]) -> Vec<Vec<(u64, u64)>> {
         .collect()
 }
 
-/// Maps every linked ID whose person is not itself to its person's key: one flat
-/// open-addressing table of [key, person] pairs (key 0 = empty slot; no ID packs to 0).
-struct PersonTable {
-    slots: Vec<[u64; 2]>,
-    bits: u32,
+/// Maps every linked ID whose person is not itself to its person's key.
+/// Partitioned by `part_of(id)` so the maps can be built in parallel.
+struct PersonMap {
+    parts: Vec<HashMap<u64, u64>>,
 }
 
-impl PersonTable {
-    #[inline(always)]
-    fn slot(&self, k: u64) -> usize {
-        (k.wrapping_mul(0x9FB2_1C65_1E98_DF25) >> (64 - self.bits)) as usize
-    }
-    #[inline(always)]
-    fn prefetch(&self, k: u64) {
-        #[cfg(target_arch = "x86_64")]
-        // SAFETY: the address is inside `slots`; prefetch never faults anyway.
-        unsafe {
-            use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
-            _mm_prefetch(self.slots.as_ptr().add(self.slot(k)) as *const i8, _MM_HINT_T0);
-        }
-    }
-    #[inline(always)]
-    fn person(&self, k: u64) -> u64 {
-        let mask = self.slots.len() - 1;
-        let mut h = self.slot(k);
-        loop {
-            let e = self.slots[h];
-            if e[0] == k {
-                return e[1];
-            }
-            if e[0] == 0 {
-                return k;
-            }
-            h = (h + 1) & mask;
-        }
-    }
-}
 
-fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonTable {
+fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
     // dense indices: sorted unique keys
     let mut keys: Vec<u64> = pairs.par_iter().flat_map_iter(|v| v.iter().flat_map(|&(a, b)| [a, b])).collect();
     keys.par_sort_unstable();
@@ -848,22 +844,23 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonTable {
             best[r] = keys[i];
         }
     }
-    // table of the IDs whose person is another ID
-    let n_map = (0..n).filter(|&i| best[roots[i] as usize] != keys[i]).count();
-    let bits = (2 * n_map).max(16).next_power_of_two().trailing_zeros();
-    let mut t = PersonTable { slots: vec![[0u64; 2]; 1 << bits], bits };
-    let mask = t.slots.len() - 1;
+    // scatter (id, person) by partition, then build the small maps in parallel
+    let mut by_part: Vec<Vec<(u64, u64)>> = new_parts();
     for i in 0..n {
         let b = best[roots[i] as usize];
         if b != keys[i] {
-            let mut h = t.slot(keys[i]);
-            while t.slots[h][0] != 0 {
-                h = (h + 1) & mask;
-            }
-            t.slots[h] = [keys[i], b];
+            by_part[part_of(keys[i])].push((keys[i], b)); // own-person IDs need no entry
         }
     }
-    t
+    let parts = by_part
+        .into_par_iter()
+        .map(|v| {
+            let mut m = HashMap::with_capacity(v.len());
+            m.extend(v);
+            m
+        })
+        .collect();
+    PersonMap { parts }
 }
 
 // ======================================================================= per-person work
@@ -958,7 +955,7 @@ impl Worker {
         let (mut d_sess, mut d_events, mut d_rev) = (0u32, 0u32, 0u64);
         while i < n {
             let start = evs[i].ts as i64;
-            let day = ((start - self.day0_ms) / DAY_MS) as u16;
+            let day = (((start - self.day0_ms) as u64) / DAY_MS as u64) as u16;
             if day != cur_day {
                 if cur_day != u16::MAX {
                     self.flush_row(person, cur_day, d_sess, d_events, d_rev);
@@ -1087,6 +1084,9 @@ macro_rules! stage {
     };
 }
 
+fn new_parts<T>() -> Vec<Vec<T>> {
+    (0..NPART).map(|_| Vec::new()).collect()
+}
 
 /// What one parse thread produces.
 struct ParseOut {
@@ -1249,7 +1249,7 @@ fn run() -> Res<()> {
     stage!(t0, "parsed links");
 
     // ---- worker 0: union-find, then parse; others: events first, clicks once the map exists
-    let gate: Gate<PersonTable> = Gate::new();
+    let gate: Gate<PersonMap> = Gate::new();
     let next = AtomicUsize::new(0);
     let n_ev = event_chunks.len();
     let n_all = n_ev + click_chunks.len();
@@ -1302,60 +1302,23 @@ fn run() -> Res<()> {
     let pmap = gate.wait();
     stage!(t0, "parsed events + clicks");
 
-    // ---- dedup events per event_id partition; look up each survivor's person (batched with
-    // prefetch) and scatter by person. Clicks get the same lookup as extra work items.
+    // ---- dedup events per event_id partition, scatter survivors by person
     let next = AtomicUsize::new(0);
     let n_ev_recs: usize = outs.iter().map(|o| o.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
     let pe_est = n_ev_recs / nthreads / NPART * 3 / 2 + 64;
-    let n_cl: usize = outs.iter().map(|o| o.cl.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let pc_est = n_cl / nthreads / NPART * 3 / 2 + 64;
-    const BATCH: usize = 32;
-    let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = std::thread::scope(|s| {
+    let ue_outs: Vec<Vec<Vec<PEv>>> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
-                let (next, outs, pmap) = (&next, &outs, &pmap);
+                let (next, outs) = (&next, &outs);
                 s.spawn(move || {
                     let mut parts: Vec<Vec<PEv>> =
                         (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
-                    let mut cparts: Vec<Vec<PCl>> =
-                        (0..NPART).map(|_| Vec::with_capacity(pc_est)).collect();
                     let mut table: Vec<u32> = Vec::new();
                     let mut srcs: Vec<&[EvRec]> = Vec::with_capacity(outs.len());
-                    let mut batch: Vec<PEv> = Vec::with_capacity(BATCH);
-                    let mut cbatch: Vec<PCl> = Vec::with_capacity(BATCH);
-                    let flush = |batch: &mut Vec<PEv>, parts: &mut Vec<Vec<PEv>>| {
-                        for e in batch.iter() {
-                            let person = pmap.person(e.person);
-                            parts[part_of(person)].push(PEv { person, ts: e.ts, pc: e.pc });
-                        }
-                        batch.clear();
-                    };
-                    let cflush = |cbatch: &mut Vec<PCl>, cparts: &mut Vec<Vec<PCl>>| {
-                        for c in cbatch.iter() {
-                            let person = pmap.person(c.person);
-                            cparts[part_of(person)].push(PCl { person, ..*c });
-                        }
-                        cbatch.clear();
-                    };
                     loop {
                         let p = next.fetch_add(1, AtOrd::Relaxed);
-                        if p >= 2 * NPART {
-                            break;
-                        }
                         if p >= NPART {
-                            // clicks (partitioned by user): person lookup, scatter by person
-                            let q = p - NPART;
-                            for o in outs.iter() {
-                                for c in &o.cl[q] {
-                                    pmap.prefetch(c.person);
-                                    cbatch.push(*c);
-                                    if cbatch.len() == BATCH {
-                                        cflush(&mut cbatch, &mut cparts);
-                                    }
-                                }
-                            }
-                            cflush(&mut cbatch, &mut cparts);
-                            continue;
+                            break;
                         }
                         // records are addressed in place as (source thread << 24 | index)
                         srcs.clear();
@@ -1396,15 +1359,52 @@ fn run() -> Res<()> {
                             if s != u32::MAX {
                                 let r = rec(s);
                                 if r.user != INVALID {
-                                    pmap.prefetch(r.user);
-                                    batch.push(PEv { person: r.user, ts: r.ts, pc: r.pc });
-                                    if batch.len() == BATCH {
-                                        flush(&mut batch, &mut parts);
-                                    }
+                                    // person resolved in the next pass (partitioned join)
+                                    parts[part_of(r.user)].push(PEv { person: r.user, ts: r.ts, pc: r.pc });
                                 }
                             }
                         }
-                        flush(&mut batch, &mut parts);
+                    }
+                    parts
+                })
+            })
+            .collect();
+        handles.into_iter().map(|h| h.join().unwrap()).collect()
+    });
+    let cu_outs: Vec<Vec<Vec<PCl>>> = outs.into_iter().map(|o| o.cl).collect();
+    stage!(t0, "dedup events");
+
+    // ---- resolve persons: user partition q only needs the small map pmap.parts[q]
+    let next = AtomicUsize::new(0);
+    let n_cl: usize = cu_outs.iter().map(|o| o.iter().map(|v| v.len()).sum::<usize>()).sum();
+    let pc_est = n_cl / nthreads / NPART * 3 / 2 + 64;
+    let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..nthreads)
+            .map(|_| {
+                let (next, ue_outs, cu_outs, pmap) = (&next, &ue_outs, &cu_outs, &pmap);
+                s.spawn(move || {
+                    let mut parts: Vec<Vec<PEv>> =
+                        (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
+                    let mut cparts: Vec<Vec<PCl>> =
+                        (0..NPART).map(|_| Vec::with_capacity(pc_est)).collect();
+                    loop {
+                        let q = next.fetch_add(1, AtOrd::Relaxed);
+                        if q >= NPART {
+                            break;
+                        }
+                        let m = &pmap.parts[q];
+                        for o in ue_outs.iter() {
+                            for e in &o[q] {
+                                let person = m.get(&e.person).copied().unwrap_or(e.person);
+                                parts[part_of(person)].push(PEv { person, ts: e.ts, pc: e.pc });
+                            }
+                        }
+                        for o in cu_outs.iter() {
+                            for c in &o[q] {
+                                let person = m.get(&c.person).copied().unwrap_or(c.person);
+                                cparts[part_of(person)].push(PCl { person, ..*c });
+                            }
+                        }
                     }
                     (parts, cparts)
                 })
@@ -1412,27 +1412,34 @@ fn run() -> Res<()> {
             .collect();
         handles.into_iter().map(|h| h.join().unwrap()).collect()
     });
-    drop(outs);
+    drop(ue_outs);
+    drop(cu_outs);
     let (pe_outs, cl_outs): (Vec<Vec<Vec<PEv>>>, Vec<Vec<Vec<PCl>>>) = resolved.into_iter().unzip();
-    stage!(t0, "dedup events + persons");
+    stage!(t0, "resolved persons");
 
     // ---- per person partition: sessions, credit, assists
     let ncat = cat_names.len();
     let next = AtomicUsize::new(0);
+    let mut order: Vec<(usize, usize)> = (0..NPART)
+        .map(|p| (pe_outs.iter().map(|o| o[p].len()).sum::<usize>(), p))
+        .collect();
+    order.sort_unstable_by(|a, b| b.cmp(a));
+    let order: Vec<usize> = order.into_iter().map(|x| x.1).collect();
     let workers: Vec<Worker> = std::thread::scope(|s| {
         let handles: Vec<_> = (0..nthreads)
             .map(|_| {
-                let (next, pe_outs, cl_outs, ctx) = (&next, &pe_outs, &cl_outs, &ctx);
+                let (next, pe_outs, cl_outs, ctx, order) = (&next, &pe_outs, &cl_outs, &ctx, &order);
                 s.spawn(move || {
                     let mut w = Worker::new(ctx, ncat);
                     let (mut evs2, mut cls2): (Vec<PEv>, Vec<PCl>) = (Vec::new(), Vec::new());
                     let (mut eoff, mut coff): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
                     let (mut tg, mut tso, mut tp) = (0u64, 0u64, 0u64);
                     loop {
-                        let p = next.fetch_add(1, AtOrd::Relaxed);
-                        if p >= NPART {
+                        let i = next.fetch_add(1, AtOrd::Relaxed);
+                        if i >= NPART {
                             break;
                         }
+                        let p = order[i];
                         let ta = Instant::now();
                         let esrc: Vec<&[PEv]> = pe_outs.iter().map(|o| &o[p][..]).collect();
                         let csrc: Vec<&[PCl]> = cl_outs.iter().map(|o| &o[p][..]).collect();
@@ -1440,7 +1447,7 @@ fn run() -> Res<()> {
                         let tb = Instant::now();
                         // group by person: counting sort into hash buckets (about one person
                         // each), then sort each small bucket by (person, ts)
-                        let bbits = (n_e / 16).max(16).next_power_of_two().trailing_zeros();
+                        let bbits = (n_e / 16).clamp(16, 1 << 12).next_power_of_two().trailing_zeros();
                         let nb = 1usize << bbits;
                         let bucket = |k: u64| (k.wrapping_mul(0xA24B_AED4_963E_E407) >> (64 - bbits)) as usize;
                         counting_sort(&esrc, &mut evs2, &mut eoff, nb, |e| bucket(e.person));
@@ -1693,7 +1700,7 @@ fn run() -> Res<()> {
 /// Counting sort of the concatenation of `srcs` into `dst` by `key` (< nb);
 /// `off[b]..off[b+1]` = bucket b.
 #[inline]
-fn counting_sort<T: Copy + Default>(
+fn counting_sort<T: Copy>(
     srcs: &[&[T]],
     dst: &mut Vec<T>,
     off: &mut Vec<u32>,
@@ -1713,15 +1720,23 @@ fn counting_sort<T: Copy + Default>(
         off[b + 1] += off[b];
     }
     dst.clear();
-    dst.resize(n, T::default());
-    let mut cur: Vec<u32> = off[..nb].to_vec();
+    dst.reserve(n);
+    // SAFETY: T is Copy (no drop); every slot 0..n is written exactly once below before any
+    // read, because the bucket ranges off[b]..off[b+1] partition 0..n.
+    unsafe { dst.set_len(n) };
+    // scatter using off[b] as the cursor of bucket b, then shift the offsets back
     for src in srcs {
         for x in src.iter() {
             let k = key(x);
-            dst[cur[k] as usize] = *x;
-            cur[k] += 1;
+            dst[off[k] as usize] = *x;
+            off[k] += 1;
         }
     }
+    // now off[b] = end of bucket b = start of bucket b + 1
+    for b in (1..=nb).rev() {
+        off[b] = off[b - 1];
+    }
+    off[0] = 0;
 }
 
 /// Single-threaded component timings on ~300 MB of events held in memory (measurement only).

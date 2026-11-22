@@ -1065,25 +1065,44 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, dc: &mut DateCache) -> Option<(u64, u3
 
 // ======================================================================= links
 
-fn parse_links(link_chunks: &[&[u8]]) -> Vec<Vec<(u64, u64)>> {
-    let (pairs, dicts): (Vec<Vec<(u64, u64)>>, Vec<Dict>) = link_chunks
+/// Link pairs per chunk, plus (key, `name_ref`) of every unpackable linked ID (the input stays
+/// mapped until the process exits), sorted by key with duplicates removed.
+fn parse_links(link_chunks: &[&[u8]]) -> (Vec<Vec<(u64, u64)>>, Vec<(u64, u64)>) {
+    let res: Vec<(Vec<(u64, u64)>, Dict, Vec<(u64, u64)>)> = link_chunks
         .par_iter()
         .map(|chunk| {
             let mut v = Vec::new();
             let mut d = Dict::new();
+            let mut refs = Vec::new();
             for_each_record_v5::<2>(chunk, |f| {
                 if !f[0].is_empty() && !f[1].is_empty() {
                     let (a, b) = (id_key(f[0]), id_key(f[1]));
-                    d.note(a, f[0]);
-                    d.note(b, f[1]);
+                    for (k, id) in [(a, f[0]), (b, f[1])] {
+                        if k & FALLBACK != 0 {
+                            d.note(k, id);
+                            if let Some(r) = name_ref(id) {
+                                refs.push((k, r));
+                            }
+                        }
+                    }
                     v.push((a, b));
                 }
             });
-            (v, d)
+            (v, d, refs)
         })
-        .unzip();
+        .collect();
+    let mut pairs = Vec::with_capacity(res.len());
+    let mut refs = Vec::new();
+    let mut dicts = Vec::with_capacity(res.len());
+    for (v, d, r) in res {
+        pairs.push(v);
+        dicts.push(d);
+        refs.extend(r);
+    }
     DICTS.write().unwrap().extend(dicts);
-    pairs
+    refs.par_sort_unstable_by_key(|r| r.0);
+    refs.dedup_by_key(|r| r.0);
+    (pairs, refs)
 }
 
 /// Maps every linked ID whose person is not itself to its person's key.
@@ -1093,7 +1112,7 @@ struct PersonMap {
 }
 
 
-fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
+fn build_person_map(pairs: &[Vec<(u64, u64)>], refs: &[(u64, u64)]) -> PersonMap {
     let tt = Instant::now();
     let tm = std::env::var_os("SS_TIMERS").is_some();
     macro_rules! uft {
@@ -1144,22 +1163,12 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
         }
         x
     }
-    // Every root is the byte-wise smallest key of its set: a union hangs the root with the
-    // larger key under the other. Ids follow sorted u64 key order, which is byte order when
-    // neither key is a fallback (interned) key.
-    let smaller = |a: u32, b: u32| -> bool {
-        let (ka, kb) = (keys[a as usize], keys[b as usize]);
-        if (ka | kb) & FALLBACK == 0 {
-            a < b
-        } else {
-            id_cmp(ka, kb) == std::cmp::Ordering::Less
-        }
-    };
+    // Unions hang the root with the larger dense id under the other: no byte comparisons here.
     for j in 0..total {
         let ra = find(&mut parent, ids[2 * j]);
         let rb = find(&mut parent, ids[2 * j + 1]);
         if ra != rb {
-            if smaller(ra, rb) {
+            if ra < rb {
                 parent[rb as usize] = ra;
             } else {
                 parent[ra as usize] = rb;
@@ -1167,13 +1176,79 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>]) -> PersonMap {
         }
     }
     uft!("unions");
+    // A person is the byte-wise smallest ID of its set, found in one pass. Dense ids follow
+    // sorted u64 key order: byte order among packed keys, all of which come before the fallback
+    // keys (bit 63). Each fallback key's bytes are fetched once, up front.
+    let fb = keys.partition_point(|&k| k & FALLBACK == 0);
+    // keys[fb..] and refs are both sorted by key: one merge walk finds every key's bytes
+    let mut fb_slices: Vec<&[u8]> = Vec::with_capacity(n - fb);
+    let mut ri = 0usize;
+    let mut slow = Vec::new();
+    let mut slow_off: Vec<(usize, usize, usize)> = Vec::new(); // (index in fb_slices, start, end)
+    for &k in &keys[fb..] {
+        while ri < refs.len() && refs[ri].0 < k {
+            ri += 1;
+        }
+        if ri < refs.len() && refs[ri].0 == k {
+            let r = refs[ri].1;
+            // SAFETY: r points at r >> 48 bytes of a links file, mapped until the process exits
+            fb_slices.push(unsafe { std::slice::from_raw_parts((r & 0xFFFF_FFFF_FFFF) as *const u8, (r >> 48) as usize) });
+        } else {
+            // an ID of 64 KB or more: through the dictionaries
+            let st = slow.len();
+            id_bytes(k, &mut slow);
+            slow_off.push((fb_slices.len(), st, slow.len()));
+            fb_slices.push(&[]);
+        }
+    }
+    for &(i, a, b) in &slow_off {
+        fb_slices[i] = &slow[a..b];
+    }
+    let (mut ta, mut tb) = (Vec::new(), Vec::new());
+    let mut less = |a: usize, b: usize| -> bool {
+        if a < fb && b < fb {
+            return a < b;
+        }
+        let sa: &[u8] = if a >= fb {
+            fb_slices[a - fb]
+        } else {
+            ta.clear();
+            id_bytes(keys[a], &mut ta);
+            &ta
+        };
+        let sb: &[u8] = if b >= fb {
+            fb_slices[b - fb]
+        } else {
+            tb.clear();
+            id_bytes(keys[b], &mut tb);
+            &tb
+        };
+        sa < sb
+    };
+    // Unions always hang the larger root under the smaller, so every parent pointer points to
+    // a smaller id: one ascending pass turns parent[] into root[] (parent[i] is final already).
+    for i in 0..n {
+        let p = parent[i] as usize;
+        parent[i] = parent[p];
+    }
+    let root = parent;
+    // best[r] = smallest member seen so far of the set rooted at r (a root starts as itself);
+    // the root is its set's smallest dense id, so only sets with fallback keys ever change
+    let mut best: Vec<u32> = (0..n as u32).collect();
+    for i in fb..n {
+        let r = root[i] as usize;
+        if less(i, best[r] as usize) {
+            best[r] = i as u32;
+        }
+    }
+    uft!("persons named");
     // scatter (id, person) by partition, then build the small maps in parallel
     let mut by_part: Vec<Vec<(u64, u64)>> = new_parts();
     for i in 0..n as u32 {
-        let r = find(&mut parent, i);
-        if r != i {
-            // own-person IDs (the roots) need no entry
-            by_part[part_of(keys[i as usize])].push((keys[i as usize], keys[r as usize]));
+        let pi = best[root[i as usize] as usize];
+        if pi != i {
+            // IDs that are their own person need no entry
+            by_part[part_of(keys[i as usize])].push((keys[i as usize], keys[pi as usize]));
         }
     }
     uft!("scattered");
@@ -1690,7 +1765,7 @@ fn run() -> Res<()> {
     }
 
     // ---- links (parallel parse)
-    let link_pairs = parse_links(&link_chunks);
+    let (link_pairs, link_refs) = parse_links(&link_chunks);
     stage!(t0, "parsed links");
 
     // ---- worker 0: union-find, then parse; others: events first, clicks once the map exists
@@ -1708,11 +1783,11 @@ fn run() -> Res<()> {
     let outs: Vec<ParseOut> = rayon::broadcast(|bc| {
         let w = bc.index();
         {
-                let (gate, next, ctx, link_pairs) = (&gate, &next, &ctx, &link_pairs);
+                let (gate, next, ctx, link_pairs, link_refs) = (&gate, &next, &ctx, &link_pairs, &link_refs);
                 let (event_chunks, click_chunks) = (&event_chunks, &click_chunks);
                 (move || {
                     if w == 0 {
-                        gate.set(build_person_map(link_pairs));
+                        gate.set(build_person_map(link_pairs, link_refs));
                         stage!(t0, "union-find done");
                     }
                     let mut out = ParseOut {

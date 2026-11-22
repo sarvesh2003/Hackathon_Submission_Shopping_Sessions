@@ -1811,6 +1811,7 @@ fn run() -> Res<()> {
                 (move || {
                     let mut w = Worker::new(ctx, ncat);
                     let (mut evs2, mut cls2): (Vec<PEv>, Vec<PCl>) = (Vec::new(), Vec::new());
+                    let mut evs3: Vec<PEv> = Vec::new();
                     let (mut eoff, mut coff): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
                     let (mut tg, mut tso, mut tp) = (0u64, 0u64, 0u64);
                     loop {
@@ -1829,7 +1830,7 @@ fn run() -> Res<()> {
                         let bbits = (n_e / 16).clamp(16, 1 << 12).next_power_of_two().trailing_zeros();
                         let nb = 1usize << bbits;
                         let bucket = |k: u64| (k.wrapping_mul(0xA24B_AED4_963E_E407) >> (64 - bbits)) as usize;
-                        counting_sort(&esrc, &mut evs2, &mut eoff, nb, |e| bucket(e.person));
+                        sort_by_bucket_ts(&esrc, &mut evs2, &mut evs3, &mut eoff, nb, bucket);
                         counting_sort(&csrc, &mut cls2, &mut coff, nb, |c| bucket(c.person));
                         let tc = Instant::now();
                         tg += (tb - ta).as_nanos() as u64;
@@ -1840,12 +1841,11 @@ fn run() -> Res<()> {
                                 continue;
                             }
                             if es.len() > 1 {
-                                // usually one person per bucket: then the timestamp alone orders it
+                                // the bucket is already in ts order; when it holds several persons,
+                                // a stable sort by person keeps each person's events in ts order
                                 let p0 = es[0].person;
-                                if es.iter().all(|e| e.person == p0) {
-                                    es.sort_unstable_by_key(|e| e.ts);
-                                } else {
-                                    es.sort_unstable_by_key(|e| ((e.person as u128) << 32) | e.ts as u128);
+                                if !es.iter().all(|e| e.person == p0) {
+                                    es.sort_by_key(|e| e.person);
                                 }
                             }
                             let cs = &mut cls2[coff[b] as usize..coff[b + 1] as usize];
@@ -2104,6 +2104,86 @@ fn run() -> Res<()> {
         std::process::exit(0)
     }
     unsafe { libc::_exit(0) }
+}
+
+/// Stable LSD radix sort of the concatenation of `srcs` by (bucket(person), ts): three passes
+/// on ts (11, 11 and 10 bits), then one counting pass on the bucket, so every bucket comes out
+/// in ts order. One read builds all four histograms. Result in `dst`, bucket b at
+/// off[b]..off[b + 1]; `tmp` is scratch.
+fn sort_by_bucket_ts(
+    srcs: &[&[PEv]],
+    dst: &mut Vec<PEv>,
+    tmp: &mut Vec<PEv>,
+    off: &mut Vec<u32>,
+    nb: usize,
+    bucket: impl Fn(u64) -> usize,
+) {
+    let mut h0 = [0u32; 2048];
+    let mut h1 = [0u32; 2048];
+    let mut h2 = [0u32; 1024];
+    off.clear();
+    off.resize(nb + 1, 0);
+    let mut n = 0usize;
+    for src in srcs {
+        n += src.len();
+        for e in src.iter() {
+            h0[(e.ts & 2047) as usize] += 1;
+            h1[((e.ts >> 11) & 2047) as usize] += 1;
+            h2[(e.ts >> 22) as usize] += 1;
+            off[bucket(e.person) + 1] += 1;
+        }
+    }
+    fn excl(h: &mut [u32]) {
+        let mut acc = 0u32;
+        for x in h.iter_mut() {
+            let c = *x;
+            *x = acc;
+            acc += c;
+        }
+    }
+    excl(&mut h0);
+    excl(&mut h1);
+    excl(&mut h2);
+    for b in 0..nb {
+        off[b + 1] += off[b];
+    }
+    dst.clear();
+    dst.reserve(n);
+    tmp.clear();
+    tmp.reserve(n);
+    // SAFETY: PEv is Copy; each pass below writes every slot 0..n exactly once before the next
+    // pass reads it (the histogram ranges partition 0..n)
+    unsafe {
+        dst.set_len(n);
+        tmp.set_len(n);
+    }
+    for src in srcs {
+        for e in src.iter() {
+            let k = (e.ts & 2047) as usize;
+            tmp[h0[k] as usize] = *e;
+            h0[k] += 1;
+        }
+    }
+    for e in tmp.iter() {
+        let k = ((e.ts >> 11) & 2047) as usize;
+        dst[h1[k] as usize] = *e;
+        h1[k] += 1;
+    }
+    for e in dst.iter() {
+        let k = (e.ts >> 22) as usize;
+        tmp[h2[k] as usize] = *e;
+        h2[k] += 1;
+    }
+    // off[b] is the cursor of bucket b; afterwards off[b] = end of b, shifted back below
+    for e in tmp.iter() {
+        let k = bucket(e.person);
+        dst[off[k] as usize] = *e;
+        off[k] += 1;
+    }
+    for b in (1..=nb).rev() {
+        off[b] = off[b - 1];
+    }
+    off[0] = 0;
 }
 
 /// Counting sort of the concatenation of `srcs` into `dst` by `key` (< nb);

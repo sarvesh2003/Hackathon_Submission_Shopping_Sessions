@@ -310,7 +310,7 @@ fn long_key(id: &[u8]) -> u64 {
 fn id_bytes(k: u64, out: &mut Vec<u8>) {
     if k & FALLBACK != 0 {
         if let Some(names) = NAMES.get() {
-            if let Some(&r) = names[part_of(k)].get(&k) {
+            if let Some(&r) = names[name_part(k)].get(&k) {
                 // SAFETY: r points at r >> 48 bytes of an input file mapped until the process exits
                 out.extend_from_slice(unsafe { std::slice::from_raw_parts((r & 0xFFFF_FFFF_FFFF) as *const u8, (r >> 48) as usize) });
                 return;
@@ -392,6 +392,15 @@ fn id_cmp(a: u64, b: u64) -> std::cmp::Ordering {
 #[inline]
 fn part_of(k: u64) -> usize {
     (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - part_bits())) as usize
+}
+
+/// Partitions of the unpackable-ID name records: few, so the parse writes them to few streams
+/// (the event records already keep `npart()` write positions busy per thread).
+const NNAME: usize = 64;
+
+#[inline(always)]
+fn name_part(k: u64) -> usize {
+    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - NNAME.trailing_zeros())) as usize
 }
 
 // ======================================================================= CSV dialect
@@ -1212,6 +1221,42 @@ struct PersonMap {
 }
 
 
+/// Sorts (key, slot) pairs by key: LSD radix, 11-bit digits, passes whose digit is the same
+/// for every key skipped.
+fn radix_sort_keys(v: &mut Vec<(u64, u32)>) {
+    const BITS: usize = 11;
+    const PASSES: usize = 64usize.div_ceil(BITS);
+    let n = v.len();
+    let mut hist = vec![[0u32; 1 << BITS]; PASSES];
+    for &(k, _) in v.iter() {
+        for (d, h) in hist.iter_mut().enumerate() {
+            h[((k >> (BITS * d)) & ((1 << BITS) - 1)) as usize] += 1;
+        }
+    }
+    let mut src = std::mem::take(v);
+    let mut dst: Vec<(u64, u32)> = Vec::with_capacity(n);
+    // SAFETY: plain data; every pass below writes all n slots before they are read
+    unsafe { dst.set_len(n) };
+    for (d, h) in hist.iter_mut().enumerate() {
+        if h.iter().any(|&c| c as usize == n) {
+            continue; // every key has the same digit here
+        }
+        let mut acc = 0u32;
+        for c in h.iter_mut() {
+            let t = *c;
+            *c = acc;
+            acc += t;
+        }
+        for &e in src.iter() {
+            let b = ((e.0 >> (BITS * d)) & ((1 << BITS) - 1)) as usize;
+            dst[h[b] as usize] = e;
+            h[b] += 1;
+        }
+        std::mem::swap(&mut src, &mut dst);
+    }
+    *v = src;
+}
+
 fn build_person_map(pairs: &[Vec<(u64, u64)>], refs: &[(u64, u64)]) -> PersonMap {
     let tt = Instant::now();
     let tm = std::env::var_os("SS_TIMERS").is_some();
@@ -1230,18 +1275,17 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>], refs: &[(u64, u64)]) -> PersonMap
         offs.push(total);
         total += v.len();
     }
-    let mut ends: Vec<(u64, u32)> = pairs
-        .par_iter()
-        .zip(offs.par_iter())
-        .flat_map_iter(|(v, &base)| {
-            v.iter().enumerate().flat_map(move |(j, &(a, b))| {
-                let s = ((base + j) * 2) as u32;
-                [(a, s), (b, s + 1)]
-            })
-        })
-        .collect();
+    // (union-find runs on one worker while the others parse: plain loops, no parallel iterators)
+    let mut ends: Vec<(u64, u32)> = Vec::with_capacity(total * 2);
+    for (v, &base) in pairs.iter().zip(offs.iter()) {
+        for (j, &(a, b)) in v.iter().enumerate() {
+            let s = ((base + j) * 2) as u32;
+            ends.push((a, s));
+            ends.push((b, s + 1));
+        }
+    }
     uft!("collected endpoints");
-    ends.par_sort_unstable_by_key(|e| e.0);
+    radix_sort_keys(&mut ends);
     uft!("sorted endpoints");
     let mut keys: Vec<u64> = Vec::with_capacity(ends.len() / 2 + 1);
     let mut ids: Vec<u32> = vec![0; ends.len()];
@@ -1342,12 +1386,18 @@ fn build_person_map(pairs: &[Vec<(u64, u64)>], refs: &[(u64, u64)]) -> PersonMap
         }
     }
     uft!("persons named");
-    // scatter (id, person) by partition, then build the small maps in parallel
-    let mut by_part: Vec<Vec<(u64, u64)>> = new_parts();
+    // scatter (id, person) by partition (counted first: exact capacities), then build the small
+    // maps in parallel; IDs that are their own person need no entry
+    let mut counts = vec![0usize; npart()];
+    for i in 0..n {
+        if best[root[i] as usize] as usize != i {
+            counts[part_of(keys[i])] += 1;
+        }
+    }
+    let mut by_part: Vec<Vec<(u64, u64)>> = counts.iter().map(|&c| Vec::with_capacity(c)).collect();
     for i in 0..n as u32 {
         let pi = best[root[i as usize] as usize];
         if pi != i {
-            // IDs that are their own person need no entry
             by_part[part_of(keys[i as usize])].push((keys[i as usize], keys[pi as usize]));
         }
     }
@@ -1666,9 +1716,6 @@ macro_rules! stage {
     };
 }
 
-fn new_parts<T>() -> Vec<Vec<T>> {
-    (0..npart()).map(|_| Vec::new()).collect()
-}
 
 /// What one parse thread produces.
 struct ParseOut {
@@ -1697,7 +1744,7 @@ fn note_huge(k: u64, id: &[u8]) {
 fn note_name(names: &mut PartBuf<(u64, u64)>, k: u64, id: &[u8]) {
     if k & FALLBACK != 0 && k != INVALID {
         match name_ref(id) {
-            Some(r) => names.push(part_of(k), (k, r)),
+            Some(r) => names.push(name_part(k), (k, r)),
             None => note_huge(k, id),
         }
     }
@@ -1924,7 +1971,7 @@ fn run() -> Res<()> {
                     let mut out = ParseOut {
                         ev: PartBuf::new(npart()),
                         cl: PartBuf::new(npart()),
-                        names: PartBuf::new(npart()),
+                        names: PartBuf::new(NNAME),
                     };
                     let mut dc = DateCache::new();
                     let mut pend: Vec<(*mut EvRec, &[u8])> = Vec::new();
@@ -2168,8 +2215,25 @@ fn run() -> Res<()> {
                     let mut dicts: Vec<(usize, HashMap<u64, u64>)> = Vec::new();
                     loop {
                         let qi = next.fetch_add(1, AtOrd::Relaxed);
-                        if qi >= npart() {
+                        if qi >= npart() + NNAME {
                             break;
+                        }
+                        if qi >= npart() {
+                            // after the user partitions: name partition qi - npart(), i.e. where
+                            // its unpackable IDs are (no input byte is read here)
+                            let q = qi - npart();
+                            let mut d: HashMap<u64, u64> = HashMap::new();
+                            for o in nm_outs.iter() {
+                                for &(k, r) in o.slices(q).flatten() {
+                                    d.entry(k).or_insert(r);
+                                }
+                            }
+                            // SAFETY: name partition q is consumed, by this thread only
+                            for o in nm_outs.iter() {
+                                unsafe { o.release(q) };
+                            }
+                            dicts.push((q, d));
+                            continue;
                         }
                         let q = rorder[qi];
                         let m = &pmap.parts[q];
@@ -2188,24 +2252,11 @@ fn run() -> Res<()> {
                                 cparts.push(part_of(person), PCl { person, ..*c });
                             }
                         }
-                        // where key partition q's unpackable IDs are (no input byte is read here)
-                        let mut d: HashMap<u64, u64> = HashMap::new();
-                        for o in nm_outs.iter() {
-                            for &(k, r) in o.slices(q).flatten() {
-                                d.entry(k).or_insert(r);
-                            }
-                        }
-                        if !d.is_empty() {
-                            dicts.push((q, d));
-                        }
                         // SAFETY: user partition q is consumed, by this thread only
                         for o in ue_outs.iter() {
                             unsafe { o.release(q) };
                         }
                         for o in cu_outs.iter() {
-                            unsafe { o.release(q) };
-                        }
-                        for o in nm_outs.iter() {
                             unsafe { o.release(q) };
                         }
                     }
@@ -2218,7 +2269,7 @@ fn run() -> Res<()> {
     drop(nm_outs);
     let mut pe_outs: Vec<PartBuf<PEv>> = Vec::with_capacity(resolved.len());
     let mut cl_outs: Vec<PartBuf<PCl>> = Vec::with_capacity(resolved.len());
-    let mut names: Vec<HashMap<u64, u64>> = (0..npart()).map(|_| HashMap::new()).collect();
+    let mut names: Vec<HashMap<u64, u64>> = (0..NNAME).map(|_| HashMap::new()).collect();
     for (e, c, ds) in resolved {
         pe_outs.push(e);
         cl_outs.push(c);

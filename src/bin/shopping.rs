@@ -41,8 +41,19 @@ const WEEK_MS: i64 = 7 * DAY_MS;
 const SESSION_GAP_MS: i64 = 1_800_000;
 const PRICE_MAX: u32 = 10_000_000;
 
-const PART_BITS: u32 = 9;
-const NPART: usize = 1 << PART_BITS;
+/// log2 of the partition count, chosen once from the input size before anything is
+/// partitioned (every stage must agree; any value gives the same output).
+static PART_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(9);
+
+#[inline(always)]
+fn part_bits() -> u32 {
+    PART_BITS.load(AtOrd::Relaxed)
+}
+
+#[inline(always)]
+fn npart() -> usize {
+    1 << part_bits()
+}
 const CHUNK_BYTES: usize = 2 << 20;
 
 // ======================================================================= IDs
@@ -329,7 +340,7 @@ fn id_cmp(a: u64, b: u64) -> std::cmp::Ordering {
 
 #[inline]
 fn part_of(k: u64) -> usize {
-    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - PART_BITS)) as usize
+    (k.wrapping_mul(0x9E37_79B9_7F4A_7C15) >> (64 - part_bits())) as usize
 }
 
 // ======================================================================= CSV dialect
@@ -1569,7 +1580,7 @@ macro_rules! stage {
 }
 
 fn new_parts<T>() -> Vec<Vec<T>> {
-    (0..NPART).map(|_| Vec::new()).collect()
+    (0..npart()).map(|_| Vec::new()).collect()
 }
 
 /// What one parse thread produces.
@@ -1751,6 +1762,19 @@ fn run() -> Res<()> {
     let link_chunks = chunk_files(&link_maps, CHUNK_BYTES);
     let event_chunks = chunk_files(&event_maps, CHUNK_BYTES);
     let click_chunks = chunk_files(&click_maps, CHUNK_BYTES);
+    // Partitions sized for the caches: per-partition tables and sort buffers were tuned at ~2 GB
+    // of event+click input (512 partitions); one more bit per doubling beyond ~2.5 GB.
+    {
+        let bytes: usize = event_chunks.iter().chain(click_chunks.iter()).map(|c| c.len()).sum();
+        let mut bits = 9u32;
+        while bits < 10 && bytes > (5usize << 29) << (bits - 9) {
+            bits += 1;
+        }
+        if let Some(b) = std::env::var("SS_PART_BITS").ok().and_then(|v| v.parse::<u32>().ok()) {
+            bits = b.clamp(6, 12);
+        }
+        PART_BITS.store(bits, AtOrd::Relaxed);
+    }
     stage!(t0, "mapped inputs");
 
     if std::env::var_os("SS_SCAN_ONLY").is_some() {
@@ -1783,7 +1807,7 @@ fn run() -> Res<()> {
     // partly filled block per (thread, partition, kind); untouched reservation costs nothing
     let in_bytes: usize = event_chunks.iter().chain(click_chunks.iter()).map(|c| c.len()).sum();
     arena::set_populate(std::env::var_os("SS_NO_POPULATE").is_none());
-    arena::init(in_bytes * 3 / 4 + nthreads * NPART * 4 * arena::BLOCK + (256 << 20));
+    arena::init(in_bytes * 3 / 4 + nthreads * npart() * 4 * arena::BLOCK + (256 << 20));
     // union-find runs on worker 0 in the global pool: nobody steals its parallel parts until
     // the other workers run out of chunks, so no second pool oversubscribes the cores
     let outs: Vec<ParseOut> = rayon::broadcast(|bc| {
@@ -1797,9 +1821,9 @@ fn run() -> Res<()> {
                         stage!(t0, "union-find done");
                     }
                     let mut out = ParseOut {
-                        ev: PartBuf::new(NPART),
-                        cl: PartBuf::new(NPART),
-                        names: PartBuf::new(NPART),
+                        ev: PartBuf::new(npart()),
+                        cl: PartBuf::new(npart()),
+                        names: PartBuf::new(npart()),
                     };
                     let mut dc = DateCache::new();
                     loop {
@@ -1851,14 +1875,14 @@ fn run() -> Res<()> {
         {
                 let (next, outs) = (&next, &outs);
                 (move || {
-                    let mut parts: PartBuf<PEv> = PartBuf::new(NPART);
+                    let mut parts: PartBuf<PEv> = PartBuf::new(npart());
                     let mut table: Vec<u64> = Vec::new();
                     let mut alive: Vec<u64> = Vec::new();
                     let mut base: Vec<u32> = Vec::with_capacity(outs.len());
                     let mut srcs: Vec<&[EvRec]> = Vec::with_capacity(outs.len());
                     loop {
                         let p = next.fetch_add(1, AtOrd::Relaxed);
-                        if p >= NPART {
+                        if p >= npart() {
                             break;
                         }
                         // records are addressed in place as (source block << 12 | index)
@@ -1951,12 +1975,12 @@ fn run() -> Res<()> {
         {
                 let (next, ue_outs, cu_outs, nm_outs, pmap) = (&next, &ue_outs, &cu_outs, &nm_outs, &pmap);
                 (move || {
-                    let mut parts: PartBuf<PEv> = PartBuf::new(NPART);
-                    let mut cparts: PartBuf<PCl> = PartBuf::new(NPART);
+                    let mut parts: PartBuf<PEv> = PartBuf::new(npart());
+                    let mut cparts: PartBuf<PCl> = PartBuf::new(npart());
                     let mut dicts: Vec<(usize, HashMap<u64, u64>)> = Vec::new();
                     loop {
                         let q = next.fetch_add(1, AtOrd::Relaxed);
-                        if q >= NPART {
+                        if q >= npart() {
                             break;
                         }
                         let m = &pmap.parts[q];
@@ -2002,7 +2026,7 @@ fn run() -> Res<()> {
     drop(nm_outs);
     let mut pe_outs: Vec<PartBuf<PEv>> = Vec::with_capacity(resolved.len());
     let mut cl_outs: Vec<PartBuf<PCl>> = Vec::with_capacity(resolved.len());
-    let mut names: Vec<HashMap<u64, u64>> = (0..NPART).map(|_| HashMap::new()).collect();
+    let mut names: Vec<HashMap<u64, u64>> = (0..npart()).map(|_| HashMap::new()).collect();
     for (e, c, ds) in resolved {
         pe_outs.push(e);
         cl_outs.push(c);
@@ -2017,7 +2041,7 @@ fn run() -> Res<()> {
     // ---- per person partition: sessions, credit, assists
     let ncat = cat_names.len();
     let next = AtomicUsize::new(0);
-    let mut order: Vec<(usize, usize)> = (0..NPART)
+    let mut order: Vec<(usize, usize)> = (0..npart())
         .map(|p| (pe_outs.iter().map(|o| o.len(p)).sum::<usize>(), p))
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
@@ -2035,7 +2059,7 @@ fn run() -> Res<()> {
                     let (mut tg, mut tso, mut tp) = (0u64, 0u64, 0u64);
                     loop {
                         let i = next.fetch_add(1, AtOrd::Relaxed);
-                        if i >= NPART {
+                        if i >= npart() {
                             break;
                         }
                         let p = order[i];
@@ -2573,7 +2597,7 @@ fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
         n as usize
     });
     run("parse_event + scatter 512", &mut || {
-        let mut parts: Vec<Vec<EvRec>> = (0..NPART).map(|_| Vec::with_capacity(lines / NPART + 64)).collect();
+        let mut parts: Vec<Vec<EvRec>> = (0..npart()).map(|_| Vec::with_capacity(lines / npart() + 64)).collect();
         for_each_record::<7>(&data, |f| {
             if !f[0].is_empty() {
                 let r = parse_event(f, ctx, &mut dc);

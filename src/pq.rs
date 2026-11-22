@@ -9,6 +9,8 @@ use std::io::Write;
 pub enum Column<'a> {
     /// UTF8 strings, all present: values concatenated in `data`, `ends[i]` = end offset of value i
     Str { name: &'a str, data: &'a [u8], ends: &'a [u32] },
+    /// UTF8 strings, all present, already in PLAIN form (each value: u32 length, then bytes)
+    PlainStr { name: &'a str, body: &'a [u8] },
     /// UTF8 strings, nullable: `present[i]` tells whether row i has a value; values (present only)
     /// as in `Str`
     OptStr { name: &'a str, data: &'a [u8], ends: &'a [u32], present: &'a [bool] },
@@ -121,6 +123,7 @@ impl<'a> Column<'a> {
     fn name(&self) -> &str {
         match self {
             Column::Str { name, .. }
+            | Column::PlainStr { name, .. }
             | Column::OptStr { name, .. }
             | Column::Date { name, .. }
             | Column::I32 { name, .. }
@@ -129,7 +132,7 @@ impl<'a> Column<'a> {
     }
     fn ptype(&self) -> i32 {
         match self {
-            Column::Str { .. } | Column::OptStr { .. } => T_BYTE_ARRAY,
+            Column::Str { .. } | Column::PlainStr { .. } | Column::OptStr { .. } => T_BYTE_ARRAY,
             Column::Date { .. } | Column::I32 { .. } => T_INT32,
             Column::I64 { .. } => T_INT64,
         }
@@ -165,7 +168,7 @@ fn page_body(col: &Column, out: &mut Vec<u8>) {
             out.extend_from_slice(&lv);
             plain_strings(data, ends, out);
         }
-        Column::Date { .. } | Column::I32 { .. } | Column::I64 { .. } => {}
+        Column::PlainStr { .. } | Column::Date { .. } | Column::I32 { .. } | Column::I64 { .. } => {}
     }
 }
 
@@ -197,6 +200,7 @@ pub fn write_file<W: Write>(w: &mut W, rows: usize, cols: &[Column]) -> std::io:
             let payload: &[u8] = match col {
                 Column::Date { values, .. } | Column::I32 { values, .. } => as_bytes(values),
                 Column::I64 { values, .. } => as_bytes(values),
+                Column::PlainStr { body: b, .. } => b,
                 _ => &body,
             };
             let mut h = Thrift::new();
@@ -233,7 +237,7 @@ pub fn write_file<W: Write>(w: &mut W, rows: usize, cols: &[Column]) -> std::io:
         m.i32f(3, rep);
         m.binf(4, col.name().as_bytes());
         match col {
-            Column::Str { .. } | Column::OptStr { .. } => {
+            Column::Str { .. } | Column::PlainStr { .. } | Column::OptStr { .. } => {
                 m.i32f(6, CT_UTF8);
                 m.begin_struct_field(10); // LogicalType
                 m.begin_struct_field(1); // STRING

@@ -329,6 +329,47 @@ fn id_bytes(k: u64, out: &mut Vec<u8>) {
     }
 }
 
+/// The bytes of packed key `k` (no FALLBACK bit), written as 16 bytes at `dst` (only the first
+/// `len` are the ID; the rest is scratch); returns `len`. BMI2 spreads the ten 6-bit codes into
+/// bytes, SSE maps codes to ASCII ('0'-'9' = 1-10, 'A'-'Z' = 11-36, '_' = 37, 'a'-'z' = 38-63).
+/// SAFETY: 16 bytes must be writable at dst.
+#[inline(always)]
+unsafe fn decode_packed16(k: u64, dst: *mut u8) -> usize {
+    use std::arch::x86_64::*;
+    let hi = _pdep_u64(k >> 12, 0x3F3F_3F3F_3F3F_3F3F).swap_bytes(); // codes 0..7, code 0 first
+    let lo = (_pdep_u64(k & 0xFFF, 0x3F3F) as u16).swap_bytes(); // codes 8, 9
+    let c = _mm_set_epi64x(lo as i64, hi as i64);
+    let gt = |v: i8| _mm_cmpgt_epi8(c, _mm_set1_epi8(v));
+    let off = _mm_add_epi8(
+        _mm_add_epi8(_mm_set1_epi8(0x2F), _mm_and_si128(gt(10), _mm_set1_epi8(7))),
+        _mm_add_epi8(_mm_and_si128(gt(36), _mm_set1_epi8(4)), _mm_and_si128(gt(37), _mm_set1_epi8(1))),
+    );
+    _mm_storeu_si128(dst as *mut __m128i, _mm_add_epi8(c, off));
+    // codes are left-aligned: the ID ends at the first zero code (bytes 10..16 are always zero)
+    (_mm_movemask_epi8(_mm_cmpeq_epi8(c, _mm_setzero_si128())) as u32).trailing_zeros() as usize
+}
+
+/// Appends the ID of key `k` to `out` in Parquet PLAIN form (u32 length, then the bytes).
+#[inline]
+fn id_plain(k: u64, out: &mut Vec<u8>) {
+    if k & FALLBACK == 0 {
+        out.reserve(20);
+        // SAFETY: 20 bytes are reserved past len: 4 for the length, 16 for decode_packed16
+        unsafe {
+            let d = out.as_mut_ptr().add(out.len());
+            let n = decode_packed16(k, d.add(4));
+            (d as *mut u32).write_unaligned(n as u32);
+            out.set_len(out.len() + 4 + n);
+        }
+    } else {
+        let at = out.len();
+        out.extend_from_slice(&[0; 4]);
+        id_bytes(k, out);
+        let n = (out.len() - at - 4) as u32;
+        out[at..at + 4].copy_from_slice(&n.to_le_bytes());
+    }
+}
+
 /// Byte-wise comparison of the strings behind two keys.
 #[inline]
 fn id_cmp(a: u64, b: u64) -> std::cmp::Ordering {
@@ -1715,84 +1756,98 @@ fn run() -> Res<()> {
 
     let products_buf = fs::read(data_dir.join("products.csv"))?;
     let campaigns_buf = fs::read(data_dir.join("campaigns.csv"))?;
-    let mut prod_rows: Vec<(&[u8], &[u8])> = Vec::new();
-    for line in data_lines(&products_buf) {
-        let mut f: [&[u8]; 2] = [&[]; 2];
-        if split_fields(line, &mut f) {
-            prod_rows.push((f[0], f[1]));
-        }
-    }
-    // distinct categories first (a few dozen), then sort only those
-    let mut seen_cats: std::collections::HashSet<&[u8]> = prod_rows.iter().map(|r| r.1).collect();
-    seen_cats.insert(b"unknown");
-    let mut cat_names: Vec<&[u8]> = seen_cats.into_iter().collect();
-    cat_names.sort_unstable();
-    if cat_names.len() > 255 {
-        return Err("more than 255 categories is not supported".into());
-    }
-    let cat_index = |c: &[u8]| cat_names.binary_search(&c).unwrap() as u8;
-    let mut prod_packed = HashMap::new();
-    let mut prod_bytes = HashMap::new();
-    for &(p, c) in &prod_rows {
-        let ci = cat_index(c);
-        match pack(p) {
-            Some(k) => {
-                prod_packed.entry(k).or_insert(ci);
-            }
-            None => {
-                prod_bytes.entry(p.to_vec()).or_insert(ci);
+    // The lookup tables (products, campaigns) are built while the big inputs are mapped and
+    // cut into chunks: the two are independent, and each alone leaves most threads idle.
+    let build_ctx = || -> Res<(Ctx, Vec<&[u8]>, Vec<(&[u8], &[u8])>)> {
+        let mut prod_rows: Vec<(&[u8], &[u8])> = Vec::with_capacity(products_buf.len() / 12 + 16);
+        for line in data_lines(&products_buf) {
+            let mut f: [&[u8]; 2] = [&[]; 2];
+            if split_fields(line, &mut f) {
+                prod_rows.push((f[0], f[1]));
             }
         }
-    }
-    let mut camp_names: Vec<(&[u8], &[u8])> = Vec::new();
-    let mut camp_packed = HashMap::new();
-    let mut camp_bytes = HashMap::new();
-    for line in data_lines(&campaigns_buf) {
-        let mut f: [&[u8]; 2] = [&[]; 2];
-        if split_fields(line, &mut f) {
-            let exists = match pack(f[0]) {
-                Some(k) => camp_packed.contains_key(&k),
-                None => camp_bytes.contains_key(f[0]),
-            };
-            if exists {
-                continue;
-            }
-            let idx = camp_names.len() as u16;
-            camp_names.push((f[0], f[1]));
-            match pack(f[0]) {
+        // distinct categories first (a few dozen), then sort only those
+        let mut seen_cats: std::collections::HashSet<&[u8]> = prod_rows.iter().map(|r| r.1).collect();
+        seen_cats.insert(b"unknown");
+        let mut cat_names: Vec<&[u8]> = seen_cats.into_iter().collect();
+        cat_names.sort_unstable();
+        if cat_names.len() > 255 {
+            return Err("more than 255 categories is not supported".into());
+        }
+        let cat_index = |c: &[u8]| cat_names.binary_search(&c).unwrap() as u8;
+        let mut prod_packed = HashMap::with_capacity(prod_rows.len());
+        let mut prod_bytes = HashMap::new();
+        for &(p, c) in &prod_rows {
+            let ci = cat_index(c);
+            match pack(p) {
                 Some(k) => {
-                    camp_packed.insert(k, idx);
+                    prod_packed.entry(k).or_insert(ci);
                 }
                 None => {
-                    camp_bytes.insert(f[0].to_vec(), idx);
+                    prod_bytes.entry(p.to_vec()).or_insert(ci);
                 }
             }
         }
-    }
-    if camp_names.len() >= u16::MAX as usize {
-        return Err("too many campaigns".into());
-    }
-    let ctx = Ctx {
-        ws,
-        we,
-        cws: ws - WEEK_MS,
-        ws_day,
-        ndays,
-        prod_packed,
-        prod_bytes,
-        unknown_cat: cat_index(b"unknown"),
-        camp_packed,
-        camp_bytes,
-        ncamp: camp_names.len(),
+        let mut camp_names: Vec<(&[u8], &[u8])> = Vec::new();
+        let mut camp_packed = HashMap::new();
+        let mut camp_bytes = HashMap::new();
+        for line in data_lines(&campaigns_buf) {
+            let mut f: [&[u8]; 2] = [&[]; 2];
+            if split_fields(line, &mut f) {
+                let exists = match pack(f[0]) {
+                    Some(k) => camp_packed.contains_key(&k),
+                    None => camp_bytes.contains_key(f[0]),
+                };
+                if exists {
+                    continue;
+                }
+                let idx = camp_names.len() as u16;
+                camp_names.push((f[0], f[1]));
+                match pack(f[0]) {
+                    Some(k) => {
+                        camp_packed.insert(k, idx);
+                    }
+                    None => {
+                        camp_bytes.insert(f[0].to_vec(), idx);
+                    }
+                }
+            }
+        }
+        if camp_names.len() >= u16::MAX as usize {
+            return Err("too many campaigns".into());
+        }
+        let ctx = Ctx {
+            ws,
+            we,
+            cws: ws - WEEK_MS,
+            ws_day,
+            ndays,
+            prod_packed,
+            prod_bytes,
+            unknown_cat: cat_index(b"unknown"),
+            camp_packed,
+            camp_bytes,
+            ncamp: camp_names.len(),
+        };
+        Ok((ctx, cat_names, camp_names))
     };
-
-    // ---- map the big inputs
-    let link_maps = map_files(&list_csv(&data_dir.join("links"))?)?;
-    let event_maps = map_files(&list_csv(&data_dir.join("events"))?)?;
-    let click_maps = map_files(&list_csv(&data_dir.join("clicks"))?)?;
-    let link_chunks = chunk_files(&link_maps, 256 << 10);
-    let event_chunks = chunk_files(&event_maps, CHUNK_BYTES);
-    let click_chunks = chunk_files(&click_maps, CHUNK_BYTES);
+    // ---- map the big inputs (the mappings live until the process exits: leaked, so the chunks
+    // borrowing them can come out of the join)
+    type Mapped = (&'static [Mmap], &'static [Mmap], &'static [Mmap]);
+    type Chunks = (Vec<&'static [u8]>, Vec<&'static [u8]>, Vec<&'static [u8]>);
+    let map_all = || -> Res<(Mapped, Chunks)> {
+        let leak = |v: Vec<Mmap>| -> &'static [Mmap] { Box::leak(v.into_boxed_slice()) };
+        let link_maps = leak(map_files(&list_csv(&data_dir.join("links"))?)?);
+        let event_maps = leak(map_files(&list_csv(&data_dir.join("events"))?)?);
+        let click_maps = leak(map_files(&list_csv(&data_dir.join("clicks"))?)?);
+        let link_chunks = chunk_files(link_maps, 256 << 10);
+        let event_chunks = chunk_files(event_maps, CHUNK_BYTES);
+        let click_chunks = chunk_files(click_maps, CHUNK_BYTES);
+        Ok(((link_maps, event_maps, click_maps), (link_chunks, event_chunks, click_chunks)))
+    };
+    let (ctx_r, maps_r) = rayon::join(build_ctx, map_all);
+    let (ctx, cat_names, camp_names) = ctx_r?;
+    let ((link_maps, event_maps, click_maps), (link_chunks, event_chunks, click_chunks)) = maps_r?;
     // Partitions sized for the caches: per-partition tables and sort buffers were tuned at ~2 GB
     // of event+click input (512 partitions); one more bit per doubling beyond ~2.5 GB.
     {
@@ -2415,13 +2470,12 @@ fn run() -> Res<()> {
     };
     let ud_job_hw = |wi: usize, w: &Worker| -> Res<()> {
         let n = w.rows.len();
-        let (mut user, mut user_end) = (Vec::with_capacity(n * 10), Vec::with_capacity(n));
+        let mut user: Vec<u8> = Vec::with_capacity(n * 16 + 64);
         let (mut top, mut top_end, mut present) = (Vec::new(), Vec::new(), Vec::with_capacity(n));
         let (mut day, mut sess, mut evs, mut rev) =
             (Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n), Vec::with_capacity(n));
         for r in &w.rows {
-            id_bytes(r.person, &mut user);
-            user_end.push(user.len() as u32);
+            id_plain(r.person, &mut user);
             day.push((ws_day + r.day as i64) as i32);
             sess.push(r.sessions as i32);
             evs.push(r.events as i32);
@@ -2435,7 +2489,7 @@ fn run() -> Res<()> {
             }
         }
         let cols = [
-            pq::Column::Str { name: "user_id", data: &user, ends: &user_end },
+            pq::Column::PlainStr { name: "user_id", body: &user },
             pq::Column::Date { name: "day", values: &day },
             pq::Column::I32 { name: "sessions", values: &sess },
             pq::Column::I32 { name: "events", values: &evs },
@@ -2487,7 +2541,7 @@ fn run() -> Res<()> {
             }
         });
     }
-    std::mem::forget(maps);
+    let _ = maps; // leaked: the mappings stay until exit
     // all files are closed; exit without freeing the heap
     // SAFETY: every output file is written and closed and stderr is unbuffered: skip the
     // atexit handlers (allocator teardown), unless SS_STD_EXIT is set (measurement)
@@ -2924,6 +2978,28 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn plain_decode_matches_id_bytes() {
+        let alphabet: &[u8] = b"0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZ_abcdefghijklmnopqrstuvwxyz";
+        let mut rng: u64 = 0x1234_5678_9abc_def1;
+        for _ in 0..200_000 {
+            rng ^= rng << 13;
+            rng ^= rng >> 7;
+            rng ^= rng << 17;
+            let len = 1 + (rng % 10) as usize;
+            let id: Vec<u8> = (0..len).map(|i| alphabet[((rng >> (i * 6 % 58)) as usize + i * 7) % alphabet.len()]).collect();
+            let k = pack(&id).unwrap();
+            let mut a = Vec::new();
+            id_bytes(k, &mut a);
+            assert_eq!(a, id);
+            let mut b = vec![9u8; 3];
+            id_plain(k, &mut b);
+            assert_eq!(&b[..3], &[9, 9, 9]);
+            assert_eq!(u32::from_le_bytes(b[3..7].try_into().unwrap()) as usize, len);
+            assert_eq!(&b[7..], &id[..]);
+        }
+    }
 
     #[test]
     fn pack_matches_scalar() {

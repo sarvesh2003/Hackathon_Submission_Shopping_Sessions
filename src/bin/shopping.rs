@@ -288,6 +288,13 @@ fn long_key(id: &[u8]) -> u64 {
 
 fn id_bytes(k: u64, out: &mut Vec<u8>) {
     if k & FALLBACK != 0 {
+        if let Some(names) = NAMES.get() {
+            if let Some(&r) = names[part_of(k)].get(&k) {
+                // SAFETY: r points at r >> 48 bytes of an input file mapped until the process exits
+                out.extend_from_slice(unsafe { std::slice::from_raw_parts((r & 0xFFFF_FFFF_FFFF) as *const u8, (r >> 48) as usize) });
+                return;
+            }
+        }
         let g = DICTS.read().unwrap();
         for d in g.iter() {
             if let Some(&(s, l)) = d.map.get(&k) {
@@ -647,13 +654,11 @@ struct DateCache {
     ok: [bool; 32],
     /// one past the current chunk (0 = unknown): lets ID packing read 16 bytes at a time
     end: usize,
-    /// bytes of the unpackable user and click IDs this thread met
-    dict: Dict,
 }
 
 impl DateCache {
     fn new() -> Self {
-        DateCache { a: [0; 32], b: [0; 32], days: [0; 32], ok: [false; 32], end: 0, dict: Dict::new() }
+        DateCache { a: [0; 32], b: [0; 32], days: [0; 32], ok: [false; 32], end: 0 }
     }
 }
 
@@ -1036,7 +1041,6 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> EvRec {
         return rec;
     }
     rec.user = id_key_at(user, dc.end);
-    dc.dict.note(rec.user, user);
     rec.ts = (ts - ctx.ws) as u32;
     // the category is only ever read for purchases (price > 0)
     let cat = if price > 0 { ctx.category(product, dc.end) } else { 0 };
@@ -1056,10 +1060,7 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, dc: &mut DateCache) -> Option<(u64, u3
     if ts < ctx.cws || ts >= ctx.we {
         return None;
     }
-    let (uk, ck) = (id_key_at(user, dc.end), id_key_at(cid, dc.end));
-    dc.dict.note(uk, user);
-    dc.dict.note(ck, cid);
-    Some((uk, (ts - ctx.cws) as u32, ck, camp))
+    Some((id_key_at(user, dc.end), (ts - ctx.cws) as u32, id_key_at(cid, dc.end), camp))
 }
 
 // ======================================================================= links
@@ -1495,8 +1496,38 @@ fn new_parts<T>() -> Vec<Vec<T>> {
 struct ParseOut {
     ev: PartBuf<EvRec>, // by event_id partition
     cl: PartBuf<PCl>,   // by user partition
-    dict: Dict,
+    /// (key, where its bytes are in the input) of every unpackable user / click ID met, by key
+    /// partition; turned into per-partition dictionaries during the resolve stage
+    names: PartBuf<(u64, u64)>,
 }
+
+/// Where an ID's bytes are: address (48 bits) | length << 48. The input stays mapped until the
+/// dictionaries are built. IDs of 64 KB or more go to the shared slow dictionary instead.
+#[inline(always)]
+fn name_ref(id: &[u8]) -> Option<u64> {
+    (id.len() < 1 << 16).then(|| id.as_ptr() as u64 | (id.len() as u64) << 48)
+}
+
+#[cold]
+fn note_huge(k: u64, id: &[u8]) {
+    let mut d = Dict::new();
+    d.note(k, id);
+    DICTS.write().unwrap().push(d);
+}
+
+#[inline(always)]
+fn note_name(names: &mut PartBuf<(u64, u64)>, k: u64, id: &[u8]) {
+    if k & FALLBACK != 0 && k != INVALID {
+        match name_ref(id) {
+            Some(r) => names.push(part_of(k), (k, r)),
+            None => note_huge(k, id),
+        }
+    }
+}
+
+/// Per key partition: where the bytes of each unpackable user / click ID are in the input
+/// (a `name_ref`), built in the resolve stage; the input stays mapped until the process exits.
+static NAMES: std::sync::OnceLock<Vec<HashMap<u64, u64>>> = std::sync::OnceLock::new();
 
 /// A one-shot value that threads can wait for.
 struct Gate<T> {
@@ -1687,7 +1718,7 @@ fn run() -> Res<()> {
                     let mut out = ParseOut {
                         ev: PartBuf::new(NPART),
                         cl: PartBuf::new(NPART),
-                        dict: Dict::new(),
+                        names: PartBuf::new(NPART),
                     };
                     let mut dc = DateCache::new();
                     loop {
@@ -1700,6 +1731,7 @@ fn run() -> Res<()> {
                             for_each_record_v5::<7>(event_chunks[i], |f| {
                                 if !f[0].is_empty() {
                                     let r = parse_event(f, ctx, &mut dc);
+                                    note_name(&mut out.names, r.user, f[1]);
                                     out.ev.push(part_of(r.eid), r);
                                 }
                             });
@@ -1709,19 +1741,18 @@ fn run() -> Res<()> {
                             dc.end = ch.as_ptr() as usize + ch.len();
                             for_each_record_v5::<4>(ch, |f| {
                                 if let Some((user, ts, cid, camp)) = parse_click(f, ctx, &mut dc) {
+                                    note_name(&mut out.names, user, f[1]);
+                                    note_name(&mut out.names, cid, f[0]);
                                     out.cl.push(part_of(user), PCl { person: user, cid, ts, camp });
                                 }
                             });
                         }
                     }
-                    out.dict = std::mem::replace(&mut dc.dict, Dict::new());
                     out
                 })()
         }
     });
     let pmap = gate.wait();
-    let mut outs = outs;
-    DICTS.write().unwrap().extend(outs.iter_mut().map(|o| std::mem::replace(&mut o.dict, Dict::new())));
     stage!(t0, "parsed events + clicks");
     // Nothing references the input files any more (records hold packed keys; odd IDs were
     // copied into the interner). Unmap them on a background thread now, overlapped with the
@@ -1731,7 +1762,7 @@ fn run() -> Res<()> {
     drop(click_chunks);
     drop(link_chunks);
     let maps = (event_maps, click_maps, link_maps);
-    std::thread::spawn(move || drop(maps));
+    // (unmapped after the resolve stage, which copies the bytes of the unpackable IDs)
 
     // ---- dedup events per event_id partition, scatter survivors by person
     let next = AtomicUsize::new(0);
@@ -1830,17 +1861,18 @@ fn run() -> Res<()> {
                 })()
         }
     });
-    let cu_outs: Vec<PartBuf<PCl>> = outs.into_iter().map(|o| o.cl).collect();
+    let (cu_outs, nm_outs): (Vec<PartBuf<PCl>>, Vec<PartBuf<(u64, u64)>>) = outs.into_iter().map(|o| (o.cl, o.names)).unzip();
     stage!(t0, "dedup events");
 
     // ---- resolve persons: user partition q only needs the small map pmap.parts[q]
     let next = AtomicUsize::new(0);
-    let resolved: Vec<(PartBuf<PEv>, PartBuf<PCl>)> = rayon::broadcast(|_bc| {
+    let resolved: Vec<(PartBuf<PEv>, PartBuf<PCl>, Vec<(usize, HashMap<u64, u64>)>)> = rayon::broadcast(|_bc| {
         {
-                let (next, ue_outs, cu_outs, pmap) = (&next, &ue_outs, &cu_outs, &pmap);
+                let (next, ue_outs, cu_outs, nm_outs, pmap) = (&next, &ue_outs, &cu_outs, &nm_outs, &pmap);
                 (move || {
                     let mut parts: PartBuf<PEv> = PartBuf::new(NPART);
                     let mut cparts: PartBuf<PCl> = PartBuf::new(NPART);
+                    let mut dicts: Vec<(usize, HashMap<u64, u64>)> = Vec::new();
                     loop {
                         let q = next.fetch_add(1, AtOrd::Relaxed);
                         if q >= NPART {
@@ -1859,6 +1891,16 @@ fn run() -> Res<()> {
                                 cparts.push(part_of(person), PCl { person, ..*c });
                             }
                         }
+                        // where key partition q's unpackable IDs are (no input byte is read here)
+                        let mut d: HashMap<u64, u64> = HashMap::new();
+                        for o in nm_outs.iter() {
+                            for &(k, r) in o.slices(q).flatten() {
+                                d.entry(k).or_insert(r);
+                            }
+                        }
+                        if !d.is_empty() {
+                            dicts.push((q, d));
+                        }
                         // SAFETY: user partition q is consumed, by this thread only
                         for o in ue_outs.iter() {
                             unsafe { o.release(q) };
@@ -1866,14 +1908,29 @@ fn run() -> Res<()> {
                         for o in cu_outs.iter() {
                             unsafe { o.release(q) };
                         }
+                        for o in nm_outs.iter() {
+                            unsafe { o.release(q) };
+                        }
                     }
-                    (parts, cparts)
+                    (parts, cparts, dicts)
                 })()
         }
     });
     drop(ue_outs);
     drop(cu_outs);
-    let (pe_outs, cl_outs): (Vec<PartBuf<PEv>>, Vec<PartBuf<PCl>>) = resolved.into_iter().unzip();
+    drop(nm_outs);
+    let mut pe_outs: Vec<PartBuf<PEv>> = Vec::with_capacity(resolved.len());
+    let mut cl_outs: Vec<PartBuf<PCl>> = Vec::with_capacity(resolved.len());
+    let mut names: Vec<HashMap<u64, u64>> = (0..NPART).map(|_| HashMap::new()).collect();
+    for (e, c, ds) in resolved {
+        pe_outs.push(e);
+        cl_outs.push(c);
+        for (q, d) in ds {
+            names[q] = d;
+        }
+    }
+    let _ = NAMES.set(names);
+    // the name dictionaries point into the input files: they stay mapped until after the write
     stage!(t0, "resolved persons");
 
     // ---- per person partition: sessions, credit, assists
@@ -2198,6 +2255,21 @@ fn run() -> Res<()> {
             );
         }
     }
+    // Drop the input mappings' pages with all workers in parallel (MADV_DONTNEED runs under the
+    // shared mmap lock), so the single-threaded exit teardown has almost nothing left to walk.
+    if std::env::var_os("SS_NO_ZAP").is_none() {
+        let regions: Vec<(usize, usize)> =
+            maps.0.iter().chain(maps.1.iter()).chain(maps.2.iter()).map(|m| (m.as_ptr() as usize, m.len())).collect();
+        rayon::broadcast(|bc| {
+            for (i, &(a, l)) in regions.iter().enumerate() {
+                if i % bc.num_threads() == bc.index() && l > 0 {
+                    // SAFETY: nothing reads the inputs any more (every file is written)
+                    unsafe { libc::madvise(a as *mut libc::c_void, l, libc::MADV_DONTNEED) };
+                }
+            }
+        });
+    }
+    std::mem::forget(maps);
     // all files are closed; exit without freeing the heap
     // SAFETY: every output file is written and closed and stderr is unbuffered: skip the
     // atexit handlers (allocator teardown), unless SS_STD_EXIT is set (measurement)

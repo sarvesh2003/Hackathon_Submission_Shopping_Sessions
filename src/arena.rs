@@ -38,6 +38,7 @@ thread_local! {
 }
 
 static ARENA: OnceLock<Arena> = OnceLock::new();
+static POPULATE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 
 /// Reserves `bytes` of address space (nothing is touched until a block is written).
 pub fn init(bytes: usize) {
@@ -85,6 +86,12 @@ fn get() -> *mut u8 {
             }
             l.cur = a.base + off;
             l.end = l.cur + HUGE;
+            if POPULATE.load(Ordering::Relaxed) {
+                // one call maps the whole slab (one huge page, or 512 small ones without THP)
+                // instead of a page-fault trap per 4 KB page; EINVAL on kernels before 5.14
+                // SAFETY: advice on our own mapping
+                unsafe { libc::madvise(l.cur as *mut libc::c_void, HUGE, 23 /* MADV_POPULATE_WRITE */) };
+            }
         }
         let b = l.cur;
         l.cur += BLOCK;
@@ -105,6 +112,24 @@ fn heap_block() -> *mut u8 {
 
 fn put(blocks: impl Iterator<Item = *mut u8>) {
     LOCAL.with(|l| l.borrow_mut().free.extend(blocks.map(|b| b as usize)));
+}
+
+/// Turns off slab pre-faulting (measurement switch).
+pub fn set_populate(on: bool) {
+    POPULATE.store(on, Ordering::Relaxed);
+}
+
+/// Releases the pages of part `i` of `n` of the used range (MADV_DONTNEED works under the
+/// shared mmap lock, so the threads zap in parallel). SAFETY: no block may be used afterwards.
+pub unsafe fn zap_part(i: usize, n: usize) {
+    let a = arena();
+    let used = used();
+    let step = used.div_ceil(n * HUGE) * HUGE;
+    let lo = (i * step).min(used);
+    let hi = ((i + 1) * step).min(used);
+    if hi > lo {
+        libc::madvise((a.base + lo) as *mut libc::c_void, hi - lo, libc::MADV_DONTNEED);
+    }
 }
 
 /// Returns the address space to the kernel. SAFETY: no block may be used afterwards.

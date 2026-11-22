@@ -1595,6 +1595,7 @@ fn run() -> Res<()> {
     // address space for all partition buffers: parse output is ~0.35 B per input byte, plus a
     // partly filled block per (thread, partition, kind); untouched reservation costs nothing
     let in_bytes: usize = event_chunks.iter().chain(click_chunks.iter()).map(|c| c.len()).sum();
+    arena::set_populate(std::env::var_os("SS_NO_POPULATE").is_none());
     arena::init(in_bytes * 3 / 4 + nthreads * NPART * 4 * arena::BLOCK + (256 << 20));
     // union-find runs on worker 0 in the global pool: nobody steals its parallel parts until
     // the other workers run out of chunks, so no second pool oversubscribes the cores
@@ -1894,7 +1895,11 @@ fn run() -> Res<()> {
     if std::env::var_os("SS_TIMERS").is_some() {
         eprintln!("arena: {} MB of fresh blocks", arena::used() >> 20);
     }
-    // SAFETY: no PartBuf is alive any more
+    // SAFETY: no PartBuf is alive any more; every worker zaps its share of the pages, so the
+    // final munmap (and the exit teardown) has almost nothing left to walk
+    if std::env::var_os("SS_NO_ZAP").is_none() {
+        rayon::broadcast(|bc| unsafe { arena::zap_part(bc.index(), bc.num_threads()) });
+    }
     std::thread::spawn(|| unsafe { arena::unmap() });
 
     // ---- merge campaign accumulators
@@ -2093,7 +2098,12 @@ fn run() -> Res<()> {
         }
     }
     // all files are closed; exit without freeing the heap
-    std::process::exit(0)
+    // SAFETY: every output file is written and closed and stderr is unbuffered: skip the
+    // atexit handlers (allocator teardown), unless SS_STD_EXIT is set (measurement)
+    if std::env::var_os("SS_STD_EXIT").is_some() {
+        std::process::exit(0)
+    }
+    unsafe { libc::_exit(0) }
 }
 
 /// Counting sort of the concatenation of `srcs` into `dst` by `key` (< nb);

@@ -144,6 +144,73 @@ struct Interner {
     names: Vec<Vec<u8>>,
 }
 
+static LEN_MASK: [u8; 32] = {
+    let mut m = [0u8; 32];
+    let mut i = 0;
+    while i < 16 {
+        m[i] = 0xFF;
+        i += 1;
+    }
+    m
+};
+
+/// Same result as `pack` for the `len` bytes at `p`, in SSE registers: per-byte range checks
+/// give the 6-bit codes, two multiply-adds fold them into 24-bit groups.
+/// SAFETY: 16 bytes must be readable at p (bytes past `len` are ignored).
+#[inline(always)]
+unsafe fn pack16(p: *const u8, len: usize) -> Option<u64> {
+    use std::arch::x86_64::*;
+    if len.wrapping_sub(1) >= MAX_PACK {
+        return None;
+    }
+    let keep = _mm_loadu_si128(LEN_MASK.as_ptr().add(16 - len) as *const __m128i);
+    let x = _mm_and_si128(_mm_loadu_si128(p as *const __m128i), keep);
+    // signed compares are exact here: every bound is below 0x80 and bytes >= 0x80 are negative
+    let rng = |lo: u8, hi: u8| {
+        _mm_and_si128(
+            _mm_cmpgt_epi8(x, _mm_set1_epi8(lo as i8 - 1)),
+            _mm_cmpgt_epi8(_mm_set1_epi8(hi as i8 + 1), x),
+        )
+    };
+    let (d, u, l) = (rng(b'0', b'9'), rng(b'A', b'Z'), rng(b'a', b'z'));
+    let us = _mm_cmpeq_epi8(x, _mm_set1_epi8(b'_' as i8));
+    let valid = _mm_or_si128(_mm_or_si128(d, u), _mm_or_si128(us, l));
+    if _mm_movemask_epi8(_mm_andnot_si128(valid, keep)) != 0 {
+        return None;
+    }
+    // code = byte - offset: '0'..'9' -> 1..10, 'A'..'Z' -> 11..36, '_' -> 37, 'a'..'z' -> 38..63
+    let off = _mm_or_si128(
+        _mm_or_si128(_mm_and_si128(d, _mm_set1_epi8(0x2F)), _mm_and_si128(u, _mm_set1_epi8(0x36))),
+        _mm_or_si128(_mm_and_si128(us, _mm_set1_epi8(0x3A)), _mm_and_si128(l, _mm_set1_epi8(0x3B))),
+    );
+    let c = _mm_sub_epi8(x, off); // 0 past the end
+    let w = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0140)); // c[2i] * 64 + c[2i+1]
+    let v = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000)); // 4 codes per 32-bit lane
+    let lo = _mm_cvtsi128_si64(v) as u64;
+    let hi = _mm_extract_epi32::<2>(v) as u32 as u64;
+    Some((lo & 0xFF_FFFF) << 36 | (lo >> 32) << 12 | hi >> 12)
+}
+
+/// `pack` through `pack16` when 16 bytes from the field start lie before `end` (the address
+/// one past the chunk the field was split from).
+#[inline(always)]
+fn pack_at(id: &[u8], end: usize) -> Option<u64> {
+    if id.as_ptr() as usize + 16 <= end {
+        // SAFETY: id lies in the chunk ending at `end`, so 16 bytes from its start are readable
+        unsafe { pack16(id.as_ptr(), id.len()) }
+    } else {
+        pack(id)
+    }
+}
+
+#[inline(always)]
+fn id_key_at(id: &[u8], end: usize) -> u64 {
+    match pack_at(id, end) {
+        Some(k) => k,
+        None => intern(id),
+    }
+}
+
 static INTERNER: LazyLock<Mutex<Interner>> = LazyLock::new(|| {
     Mutex::new(Interner { map: std::collections::HashMap::new(), names: Vec::new() })
 });
@@ -523,11 +590,13 @@ struct DateCache {
     b: [u16; 32],
     days: [i64; 32],
     ok: [bool; 32],
+    /// one past the current chunk (0 = unknown): lets ID packing read 16 bytes at a time
+    end: usize,
 }
 
 impl DateCache {
     fn new() -> Self {
-        DateCache { a: [0; 32], b: [0; 32], days: [0; 32], ok: [false; 32] }
+        DateCache { a: [0; 32], b: [0; 32], days: [0; 32], ok: [false; 32], end: 0 }
     }
 }
 
@@ -869,8 +938,8 @@ impl Ctx {
         }
     }
     #[inline]
-    fn campaign(&self, c: &[u8]) -> Option<u16> {
-        match pack(c) {
+    fn campaign(&self, c: &[u8], end: usize) -> Option<u16> {
+        match pack_at(c, end) {
             Some(k) => self.camp_packed.get(&k).copied(),
             None => self.camp_bytes.get(c).copied(),
         }
@@ -880,7 +949,7 @@ impl Ctx {
 /// Fields already split; event_id is non-empty.
 #[inline(always)]
 fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> EvRec {
-    let eid = id_key(f[0]);
+    let eid = id_key_at(f[0], dc.end);
     let ingest = parse_ts_c(f[3], dc).unwrap_or(i64::MAX);
     let mut rec = EvRec { eid, user: INVALID, ingest, ts: 0, pc: 0 };
     let (user, ts_raw, etype, product, price_raw) = (f[1], f[2], f[4], f[5], f[6]);
@@ -902,7 +971,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> EvRec {
     if ingest.saturating_sub(ts) > DAY_MS {
         return rec;
     }
-    rec.user = id_key(user);
+    rec.user = id_key_at(user, dc.end);
     rec.ts = (ts - ctx.ws) as u32;
     // the category is only ever read for purchases (price > 0)
     let cat = if price > 0 { ctx.category(product) } else { 0 };
@@ -917,12 +986,12 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, dc: &mut DateCache) -> Option<(u64, u3
     if cid.is_empty() || user.is_empty() {
         return None;
     }
-    let camp = ctx.campaign(camp)?;
+    let camp = ctx.campaign(camp, dc.end)?;
     let ts = parse_ts_c(ts_raw, dc)?;
     if ts < ctx.cws || ts >= ctx.we {
         return None;
     }
-    Some((id_key(user), (ts - ctx.cws) as u32, id_key(cid), camp))
+    Some((id_key_at(user, dc.end), (ts - ctx.cws) as u32, id_key_at(cid, dc.end), camp))
 }
 
 // ======================================================================= links
@@ -1550,6 +1619,7 @@ fn run() -> Res<()> {
                             break;
                         }
                         if i < n_ev {
+                            dc.end = event_chunks[i].as_ptr() as usize + event_chunks[i].len();
                             for_each_record_v5::<7>(event_chunks[i], |f| {
                                 if !f[0].is_empty() {
                                     let r = parse_event(f, ctx, &mut dc);
@@ -1558,7 +1628,9 @@ fn run() -> Res<()> {
                             });
                         } else {
                             // by user partition; the person is resolved later (partitioned join)
-                            for_each_record_v5::<4>(click_chunks[i - n_ev], |f| {
+                            let ch = click_chunks[i - n_ev];
+                            dc.end = ch.as_ptr() as usize + ch.len();
+                            for_each_record_v5::<4>(ch, |f| {
                                 if let Some((user, ts, cid, camp)) = parse_click(f, ctx, &mut dc) {
                                     out.cl.push(part_of(user), PCl { person: user, cid, ts, camp });
                                 }
@@ -2118,6 +2190,12 @@ fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
         for_each_record::<7>(&data, |f| n = n.wrapping_add(id_key(f[0])));
         n as usize
     });
+    let dend = data.as_ptr() as usize + data.len();
+    run("+ pack16 eid", &mut || {
+        let mut n = 0u64;
+        for_each_record::<7>(&data, |f| n = n.wrapping_add(id_key_at(f[0], dend)));
+        n as usize
+    });
     run("+ parse ts", &mut || {
         let mut n = 0i64;
         for_each_record::<7>(&data, |f| n = n.wrapping_add(parse_ts(f[2]).unwrap_or(0)));
@@ -2139,6 +2217,7 @@ fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
         n
     });
     let mut dc = DateCache::new();
+    dc.end = dend;
     run("full parse_event", &mut || {
         let mut n = 0u64;
         for_each_record::<7>(&data, |f| {
@@ -2341,6 +2420,10 @@ mod tests {
                 .map(|_| if next() % 4 == 0 { alphabet[(next() as usize) % alphabet.len()] } else { b"0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_"[(next() % 63) as usize] })
                 .collect();
             assert_eq!(pack(&v), pack_scalar(&v), "{:?}", v);
+            let mut buf = v.clone();
+            buf.extend((0..16).map(|_| next() as u8));
+            // SAFETY: buf has v.len() + 16 bytes
+            assert_eq!(unsafe { pack16(buf.as_ptr(), v.len()) }, pack_scalar(&v), "{:?}", v);
         }
     }
 

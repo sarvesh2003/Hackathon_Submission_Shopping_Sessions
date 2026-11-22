@@ -71,7 +71,7 @@ fn arena() -> &'static Arena {
     ARENA.get().expect("arena::init not called")
 }
 
-/// One 16 KB block, 4 KB aligned: one this thread recycled if any, else fresh.
+/// One 16 KB block, 16 KB aligned: one this thread recycled if any, else fresh.
 fn get() -> *mut u8 {
     LOCAL.with(|l| {
         let mut l = l.borrow_mut();
@@ -101,7 +101,8 @@ fn get() -> *mut u8 {
 
 #[cold]
 fn heap_block() -> *mut u8 {
-    let layout = Layout::from_size_align(BLOCK, 4096).unwrap();
+    // BLOCK-aligned like the arena's blocks (PartBuf finds a block from a pointer into it)
+    let layout = Layout::from_size_align(BLOCK, BLOCK).unwrap();
     // SAFETY: non-zero size; the block is never freed (it may be recycled through `free`)
     let p = unsafe { std::alloc::alloc(layout) };
     if p.is_null() {
@@ -147,8 +148,9 @@ pub fn used() -> usize {
 
 /// Per-thread output of a stage: one growable list of blocks per partition.
 pub struct PartBuf<T: Copy> {
-    /// current block of each partition and how many records it holds (null = none yet)
-    heads: Vec<(*mut T, u32)>,
+    /// write position in each partition's current block (null = no block yet). Blocks are
+    /// BLOCK-aligned, so the block and the fill level follow from the pointer alone.
+    cur: Vec<*mut T>,
     full: Vec<Vec<*mut T>>,
 }
 
@@ -158,59 +160,70 @@ unsafe impl<T: Copy + Sync> Sync for PartBuf<T> {}
 
 impl<T: Copy> PartBuf<T> {
     pub const CAP: usize = BLOCK / std::mem::size_of::<T>();
+    const SIZE: usize = std::mem::size_of::<T>();
 
     pub fn new(nparts: usize) -> Self {
         assert!(Self::CAP >= 1 && Self::CAP <= 4096 && std::mem::align_of::<T>() <= 4096);
-        PartBuf { heads: vec![(std::ptr::null_mut(), Self::CAP as u32); nparts], full: (0..nparts).map(|_| Vec::new()).collect() }
+        PartBuf { cur: vec![std::ptr::null_mut(); nparts], full: (0..nparts).map(|_| Vec::new()).collect() }
+    }
+
+    /// Start of the block a non-null write position belongs to (the position is one past a
+    /// written record, so it can equal the block end but never the block start).
+    #[inline(always)]
+    fn block_of(w: *mut T) -> *mut T {
+        ((w as usize - 1) & !(BLOCK - 1)) as *mut T
     }
 
     #[inline(always)]
     pub fn push(&mut self, p: usize, x: T) {
-        if self.heads[p].1 as usize == Self::CAP {
-            self.next_block(p);
+        let w = self.cur[p];
+        // full when another record does not fit after w; a null w (no block yet) counts as full
+        let w = if ((w as usize).wrapping_sub(1) & (BLOCK - 1)) >= BLOCK - Self::SIZE { self.next_block(p) } else { w };
+        // SAFETY: w has room for one record inside its block
+        unsafe {
+            w.write(x);
+            self.cur[p] = w.add(1);
         }
-        let h = &mut self.heads[p];
-        // SAFETY: h.0 is a block of CAP records and h.1 < CAP
-        unsafe { h.0.add(h.1 as usize).write(x) };
-        h.1 += 1;
     }
 
     #[cold]
     #[inline(never)]
-    fn next_block(&mut self, p: usize) {
-        let h = &mut self.heads[p];
-        if !h.0.is_null() {
-            self.full[p].push(h.0);
+    fn next_block(&mut self, p: usize) -> *mut T {
+        let w = self.cur[p];
+        if !w.is_null() {
+            self.full[p].push(Self::block_of(w));
         }
-        *h = (get() as *mut T, 0);
+        get() as *mut T
+    }
+
+    fn head(&self, p: usize) -> &[T] {
+        let w = self.cur[p];
+        if w.is_null() {
+            return &[];
+        }
+        let b = Self::block_of(w);
+        // SAFETY: the records from the block start up to w were written
+        unsafe { std::slice::from_raw_parts(b, (w as usize - b as usize) / Self::SIZE) }
     }
 
     /// Records of partition p, in insertion order.
     pub fn slices(&self, p: usize) -> impl Iterator<Item = &[T]> + '_ {
-        let h = self.heads[p];
-        let head: &[T] = if h.0.is_null() {
-            &[]
-        } else {
-            // SAFETY: the first h.1 records of the current block were written
-            unsafe { std::slice::from_raw_parts(h.0, h.1 as usize) }
-        };
         self.full[p]
             .iter()
             // SAFETY: full blocks hold CAP written records
             .map(|&b| unsafe { std::slice::from_raw_parts(b as *const T, Self::CAP) })
-            .chain(std::iter::once(head))
+            .chain(std::iter::once(self.head(p)))
             .filter(|s| !s.is_empty())
     }
 
     pub fn len(&self, p: usize) -> usize {
-        let h = self.heads[p];
-        self.full[p].len() * Self::CAP + if h.0.is_null() { 0 } else { h.1 as usize }
+        self.full[p].len() * Self::CAP + self.head(p).len()
     }
 
     /// Hands partition p's blocks to the next stage. SAFETY: partition p of this buffer must
     /// never be read again (each partition is consumed exactly once, by one thread).
     pub unsafe fn release(&self, p: usize) {
-        let h = self.heads[p];
-        put(self.full[p].iter().map(|&b| b as *mut u8).chain((!h.0.is_null()).then_some(h.0 as *mut u8)));
+        let w = self.cur[p];
+        put(self.full[p].iter().map(|&b| b as *mut u8).chain((!w.is_null()).then(|| Self::block_of(w) as *mut u8)));
     }
 }

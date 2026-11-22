@@ -1877,6 +1877,7 @@ fn run() -> Res<()> {
                 (move || {
                     let mut parts: PartBuf<PEv> = PartBuf::new(npart());
                     let mut table: Vec<u64> = Vec::new();
+                    let mut table32: Vec<u32> = Vec::new();
                     let mut alive: Vec<u64> = Vec::new();
                     let mut base: Vec<u32> = Vec::with_capacity(outs.len());
                     let mut srcs: Vec<&[EvRec]> = Vec::with_capacity(outs.len());
@@ -1905,44 +1906,86 @@ fn run() -> Res<()> {
                         let dense = |id: u32| (base[(id >> 12) as usize] + (id & 0xFFF)) as usize;
                         alive.clear();
                         alive.resize(n.div_ceil(64), 0);
-                        // load factor 1/3..2/3: a 512 KB table at 20M, half a Cascade Lake L2
+                        // load factor 1/3..2/3 (a 256 KB table of 4-byte slots at 20M)
                         let bits = (n + n / 2).next_power_of_two().trailing_zeros().max(4);
                         let mask = (1usize << bits) - 1;
-                        // slot = (32 hash bits below the index bits) << 32 | id; EMPTY = u64::MAX
-                        const EMPTY: u64 = u64::MAX;
-                        table.clear();
-                        table.resize(1 << bits, EMPTY);
-                        for (t, src) in srcs.iter().enumerate() {
-                            for (i, cur) in src.iter().enumerate() {
-                                let id = ((t as u32) << 12) | i as u32;
-                                let k = cur.eid;
-                                let mixed = k.wrapping_mul(0xD6E8_FEB8_6659_FD93);
-                                let tag = (mixed << bits) & 0xFFFF_FFFF_0000_0000;
-                                let mut h = (mixed >> (64 - bits)) as usize;
-                                loop {
-                                    let s = table[h];
-                                    if s == EMPTY {
-                                        table[h] = tag | id as u64;
-                                        let g = dense(id);
-                                        alive[g >> 6] |= 1u64 << (g & 63);
-                                        break;
-                                    }
-                                    if s & 0xFFFF_FFFF_0000_0000 == tag {
-                                        let old = s as u32;
-                                        let r = rec(old);
-                                        if r.eid == k {
-                                            // keep the smallest ingest_ts; on a tie, the first seen
-                                            if cur.ingest < r.ingest {
-                                                table[h] = tag | id as u64;
-                                                let go = dense(old);
-                                                alive[go >> 6] &= !(1u64 << (go & 63));
-                                                let g = dense(id);
-                                                alive[g >> 6] |= 1u64 << (g & 63);
-                                            }
+                        if n < (1 << 20) - 1 {
+                            // 4-byte slots: 12 hash bits below the index bits << 20 | (dense number
+                            // + 1); 0 = empty. Half the table of the 8-byte layout, so it stays in
+                            // L2 when two hyperthreads share it. A tag match finds its record by a
+                            // binary search over the source blocks (duplicates are a few percent).
+                            table32.clear();
+                            table32.resize(1 << bits, 0);
+                            let mut g = 0u32;
+                            for src in srcs.iter() {
+                                for cur in src.iter() {
+                                    let k = cur.eid;
+                                    let mixed = k.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+                                    let tag = (((mixed << bits) >> 52) as u32) << 20;
+                                    let mut h = (mixed >> (64 - bits)) as usize;
+                                    loop {
+                                        let sl = table32[h];
+                                        if sl == 0 {
+                                            table32[h] = tag | (g + 1);
+                                            alive[(g >> 6) as usize] |= 1u64 << (g & 63);
                                             break;
                                         }
+                                        if sl & 0xFFF0_0000 == tag {
+                                            let og = (sl & 0x000F_FFFF) - 1;
+                                            let t = base.partition_point(|&x| x <= og) - 1;
+                                            let r = &srcs[t][(og - base[t]) as usize];
+                                            if r.eid == k {
+                                                // keep the smallest ingest_ts; on a tie, the first seen
+                                                if cur.ingest < r.ingest {
+                                                    table32[h] = tag | (g + 1);
+                                                    alive[(og >> 6) as usize] &= !(1u64 << (og & 63));
+                                                    alive[(g >> 6) as usize] |= 1u64 << (g & 63);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        h = (h + 1) & mask;
                                     }
-                                    h = (h + 1) & mask;
+                                    g += 1;
+                                }
+                            }
+                        } else {
+                            // slot = (32 hash bits below the index bits) << 32 | id; EMPTY = u64::MAX
+                            const EMPTY: u64 = u64::MAX;
+                            table.clear();
+                            table.resize(1 << bits, EMPTY);
+                            for (t, src) in srcs.iter().enumerate() {
+                                for (i, cur) in src.iter().enumerate() {
+                                    let id = ((t as u32) << 12) | i as u32;
+                                    let k = cur.eid;
+                                    let mixed = k.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+                                    let tag = (mixed << bits) & 0xFFFF_FFFF_0000_0000;
+                                    let mut h = (mixed >> (64 - bits)) as usize;
+                                    loop {
+                                        let s = table[h];
+                                        if s == EMPTY {
+                                            table[h] = tag | id as u64;
+                                            let g = dense(id);
+                                            alive[g >> 6] |= 1u64 << (g & 63);
+                                            break;
+                                        }
+                                        if s & 0xFFFF_FFFF_0000_0000 == tag {
+                                            let old = s as u32;
+                                            let r = rec(old);
+                                            if r.eid == k {
+                                                // keep the smallest ingest_ts; on a tie, the first seen
+                                                if cur.ingest < r.ingest {
+                                                    table[h] = tag | id as u64;
+                                                    let go = dense(old);
+                                                    alive[go >> 6] &= !(1u64 << (go & 63));
+                                                    let g = dense(id);
+                                                    alive[g >> 6] |= 1u64 << (g & 63);
+                                                }
+                                                break;
+                                            }
+                                        }
+                                        h = (h + 1) & mask;
+                                    }
                                 }
                             }
                         }
@@ -1971,18 +2014,25 @@ fn run() -> Res<()> {
 
     // ---- resolve persons: user partition q only needs the small map pmap.parts[q]
     let next = AtomicUsize::new(0);
+    // largest partitions first (a whale's partition claimed last would be the stage's tail)
+    let mut rorder: Vec<(usize, usize)> = (0..npart())
+        .map(|q| (ue_outs.iter().map(|o| o.len(q)).sum::<usize>() + cu_outs.iter().map(|o| o.len(q)).sum::<usize>(), q))
+        .collect();
+    rorder.sort_unstable_by(|a, b| b.cmp(a));
+    let rorder: Vec<usize> = rorder.into_iter().map(|x| x.1).collect();
     let resolved: Vec<(PartBuf<PEv>, PartBuf<PCl>, Vec<(usize, HashMap<u64, u64>)>)> = rayon::broadcast(|_bc| {
         {
-                let (next, ue_outs, cu_outs, nm_outs, pmap) = (&next, &ue_outs, &cu_outs, &nm_outs, &pmap);
+                let (next, ue_outs, cu_outs, nm_outs, pmap, rorder) = (&next, &ue_outs, &cu_outs, &nm_outs, &pmap, &rorder);
                 (move || {
                     let mut parts: PartBuf<PEv> = PartBuf::new(npart());
                     let mut cparts: PartBuf<PCl> = PartBuf::new(npart());
                     let mut dicts: Vec<(usize, HashMap<u64, u64>)> = Vec::new();
                     loop {
-                        let q = next.fetch_add(1, AtOrd::Relaxed);
-                        if q >= npart() {
+                        let qi = next.fetch_add(1, AtOrd::Relaxed);
+                        if qi >= npart() {
                             break;
                         }
+                        let q = rorder[qi];
                         let m = &pmap.parts[q];
                         for o in ue_outs.iter() {
                             for e in o.slices(q).flatten() {

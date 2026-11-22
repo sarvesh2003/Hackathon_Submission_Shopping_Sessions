@@ -14,7 +14,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering as AtOrd};
-use std::sync::{Arc, Condvar, LazyLock, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::Instant;
 
 use hashbrown::HashMap;
@@ -139,9 +139,67 @@ fn pack(id: &[u8]) -> Option<u64> {
     }
 }
 
-struct Interner {
-    map: std::collections::HashMap<Vec<u8>, u64>,
-    names: Vec<Vec<u8>>,
+/// Bytes of the IDs that cannot be packed (key -> bytes), filled by the thread that met them.
+/// Only IDs whose bytes are ever needed are noted: users and click IDs (output names, person
+/// naming, the click tie-break) and both sides of every link. Event IDs are only compared for
+/// equality, so they are never noted.
+struct Dict {
+    map: HashMap<u64, (u32, u32)>,
+    bytes: Vec<u8>,
+}
+
+impl Dict {
+    fn new() -> Self {
+        Dict { map: HashMap::new(), bytes: Vec::new() }
+    }
+    #[inline]
+    fn note(&mut self, k: u64, id: &[u8]) {
+        if k & FALLBACK != 0 {
+            self.note_slow(k, id);
+        }
+    }
+    #[cold]
+    #[inline(never)]
+    fn note_slow(&mut self, k: u64, id: &[u8]) {
+        let bytes = &mut self.bytes;
+        self.map.entry(k).or_insert_with(|| {
+            let s = bytes.len();
+            bytes.extend_from_slice(id);
+            (s as u32, id.len() as u32)
+        });
+    }
+}
+
+/// Every thread's dictionary, published after links and after parsing (lookups are rare).
+static DICTS: std::sync::RwLock<Vec<Dict>> = std::sync::RwLock::new(Vec::new());
+
+/// 64-bit hash of a byte string (folded 64x64->128 multiplies, length-seeded, fmix64 finish).
+#[inline]
+fn hash_bytes(s: &[u8]) -> u64 {
+    #[inline(always)]
+    fn fold(a: u64, b: u64) -> u64 {
+        let r = (a as u128) * (b as u128);
+        (r as u64) ^ ((r >> 64) as u64)
+    }
+    let n = s.len();
+    let mut h = 0x243F_6A88_85A3_08D3u64 ^ (n as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+    let mut i = 0;
+    while i + 8 <= n {
+        let w = u64::from_le_bytes(s[i..i + 8].try_into().unwrap());
+        h = fold(h ^ w, 0xA076_1D64_78BD_642F) ^ w.rotate_left(29);
+        i += 8;
+    }
+    if i < n {
+        let mut t = [0u8; 8];
+        t[..n - i].copy_from_slice(&s[i..]);
+        let w = u64::from_le_bytes(t);
+        h = fold(h ^ w, 0xE703_7ED1_A0B4_28DB) ^ w.rotate_left(29);
+    }
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+    h ^= h >> 33;
+    h = h.wrapping_mul(0xC4CE_B9FE_1A85_EC53);
+    h ^ (h >> 33)
 }
 
 static LEN_MASK: [u8; 32] = {
@@ -207,38 +265,37 @@ fn pack_at(id: &[u8], end: usize) -> Option<u64> {
 fn id_key_at(id: &[u8], end: usize) -> u64 {
     match pack_at(id, end) {
         Some(k) => k,
-        None => intern(id),
+        None => long_key(id),
     }
 }
-
-static INTERNER: LazyLock<Mutex<Interner>> = LazyLock::new(|| {
-    Mutex::new(Interner { map: std::collections::HashMap::new(), names: Vec::new() })
-});
 
 #[inline]
 fn id_key(id: &[u8]) -> u64 {
     match pack(id) {
         Some(k) => k,
-        None => intern(id),
+        None => long_key(id),
     }
 }
 
-#[cold]
-fn intern(id: &[u8]) -> u64 {
-    let mut g = INTERNER.lock().unwrap();
-    if let Some(&k) = g.map.get(id) {
-        return k;
-    }
-    let k = FALLBACK | g.names.len() as u64;
-    g.names.push(id.to_vec());
-    g.map.insert(id.to_vec(), k);
-    k
+/// Key of an ID that cannot be packed (longer than 10 bytes or outside [0-9A-Z_a-z]): bit 63
+/// set (never equal to a packed key) and 63 bits of a strong hash of its bytes; never INVALID.
+/// Equal IDs get equal keys; two different IDs collide with probability ~2^-63 per pair.
+#[inline]
+fn long_key(id: &[u8]) -> u64 {
+    let v = hash_bytes(id) >> 1;
+    FALLBACK | if v == (1u64 << 63) - 1 { 0 } else { v }
 }
 
 fn id_bytes(k: u64, out: &mut Vec<u8>) {
     if k & FALLBACK != 0 {
-        let g = INTERNER.lock().unwrap();
-        out.extend_from_slice(&g.names[(k & !FALLBACK) as usize]);
+        let g = DICTS.read().unwrap();
+        for d in g.iter() {
+            if let Some(&(s, l)) = d.map.get(&k) {
+                out.extend_from_slice(&d.bytes[s as usize..(s + l) as usize]);
+                return;
+            }
+        }
+        panic!("no bytes noted for ID key {k:#x}");
     } else {
         for i in 0..MAX_PACK {
             let c = (k >> (6 * (MAX_PACK - 1 - i))) & 63;
@@ -592,11 +649,13 @@ struct DateCache {
     ok: [bool; 32],
     /// one past the current chunk (0 = unknown): lets ID packing read 16 bytes at a time
     end: usize,
+    /// bytes of the unpackable user and click IDs this thread met
+    dict: Dict,
 }
 
 impl DateCache {
     fn new() -> Self {
-        DateCache { a: [0; 32], b: [0; 32], days: [0; 32], ok: [false; 32], end: 0 }
+        DateCache { a: [0; 32], b: [0; 32], days: [0; 32], ok: [false; 32], end: 0, dict: Dict::new() }
     }
 }
 
@@ -979,6 +1038,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> EvRec {
         return rec;
     }
     rec.user = id_key_at(user, dc.end);
+    dc.dict.note(rec.user, user);
     rec.ts = (ts - ctx.ws) as u32;
     // the category is only ever read for purchases (price > 0)
     let cat = if price > 0 { ctx.category(product, dc.end) } else { 0 };
@@ -998,24 +1058,33 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, dc: &mut DateCache) -> Option<(u64, u3
     if ts < ctx.cws || ts >= ctx.we {
         return None;
     }
-    Some((id_key_at(user, dc.end), (ts - ctx.cws) as u32, id_key_at(cid, dc.end), camp))
+    let (uk, ck) = (id_key_at(user, dc.end), id_key_at(cid, dc.end));
+    dc.dict.note(uk, user);
+    dc.dict.note(ck, cid);
+    Some((uk, (ts - ctx.cws) as u32, ck, camp))
 }
 
 // ======================================================================= links
 
 fn parse_links(link_chunks: &[&[u8]]) -> Vec<Vec<(u64, u64)>> {
-    link_chunks
+    let (pairs, dicts): (Vec<Vec<(u64, u64)>>, Vec<Dict>) = link_chunks
         .par_iter()
         .map(|chunk| {
             let mut v = Vec::new();
+            let mut d = Dict::new();
             for_each_record_v5::<2>(chunk, |f| {
                 if !f[0].is_empty() && !f[1].is_empty() {
-                    v.push((id_key(f[0]), id_key(f[1])));
+                    let (a, b) = (id_key(f[0]), id_key(f[1]));
+                    d.note(a, f[0]);
+                    d.note(b, f[1]);
+                    v.push((a, b));
                 }
             });
-            v
+            (v, d)
         })
-        .collect()
+        .unzip();
+    DICTS.write().unwrap().extend(dicts);
+    pairs
 }
 
 /// Maps every linked ID whose person is not itself to its person's key.
@@ -1428,6 +1497,7 @@ fn new_parts<T>() -> Vec<Vec<T>> {
 struct ParseOut {
     ev: PartBuf<EvRec>, // by event_id partition
     cl: PartBuf<PCl>,   // by user partition
+    dict: Dict,
 }
 
 /// A one-shot value that threads can wait for.
@@ -1619,6 +1689,7 @@ fn run() -> Res<()> {
                     let mut out = ParseOut {
                         ev: PartBuf::new(NPART),
                         cl: PartBuf::new(NPART),
+                        dict: Dict::new(),
                     };
                     let mut dc = DateCache::new();
                     loop {
@@ -1645,11 +1716,14 @@ fn run() -> Res<()> {
                             });
                         }
                     }
+                    out.dict = std::mem::replace(&mut dc.dict, Dict::new());
                     out
                 })()
         }
     });
     let pmap = gate.wait();
+    let mut outs = outs;
+    DICTS.write().unwrap().extend(outs.iter_mut().map(|o| std::mem::replace(&mut o.dict, Dict::new())));
     stage!(t0, "parsed events + clicks");
     // Nothing references the input files any more (records hold packed keys; odd IDs were
     // copied into the interner). Unmap them on a background thread now, overlapped with the

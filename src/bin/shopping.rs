@@ -1427,10 +1427,13 @@ impl Worker {
             return;
         }
 
-        // first session index of each day (sessions are sorted by start)
+        // first session index of each day (sessions are sorted by start), for the days this
+        // person has: flush_assist reads day_first[d + 1] for days d of its sessions only
         {
+            let d0 = self.sessions[0].day as usize;
+            let dl = (self.sessions[self.sessions.len() - 1].day as usize + 1).min(nd);
             let mut k = 0usize;
-            for d in 0..=nd {
+            for d in d0..=dl {
                 while k < self.sessions.len() && (self.sessions[k].day as usize) < d {
                     k += 1;
                 }
@@ -2125,6 +2128,8 @@ fn run() -> Res<()> {
     let mut order: Vec<(usize, usize)> = (0..npart())
         .map(|p| (pe_outs.iter().map(|o| o.len(p)).sum::<usize>(), p))
         .collect();
+    // output rows: about one per 9 surviving events, spread over the workers
+    let rows_est = order.iter().map(|o| o.0).sum::<usize>() / 8 / nthreads + 1024;
     order.sort_unstable_by(|a, b| b.cmp(a));
     let order: Vec<usize> = order.into_iter().map(|x| x.1).collect();
     let workers: Vec<Worker> = rayon::broadcast(|_bc| {
@@ -2132,6 +2137,7 @@ fn run() -> Res<()> {
                 let (next, pe_outs, cl_outs, ctx, order) = (&next, &pe_outs, &cl_outs, &ctx, &order);
                 (move || {
                     let mut w = Worker::new(ctx, ncat);
+                    w.rows.reserve(rows_est);
                     let (mut evs2, mut cls2): (Vec<PEv>, Vec<PCl>) = (Vec::new(), Vec::new());
                     let mut evs3: Vec<PEv> = Vec::new();
                     let mut evs_pre: Vec<PEv> = Vec::new();

@@ -6,12 +6,16 @@
 //! about once for the peak live data instead of once per stage. Buffers are lists of blocks,
 //! so no buffer is ever copied to grow.
 //!
+//! Allocation is lock-free: each thread takes 2 MB slabs from the shared bump pointer and keeps
+//! its own list of recycled blocks (a thread recycles the blocks of the partitions it consumed).
+//!
 //! When the mapping is exhausted, blocks come from the heap (never freed; correctness does not
 //! depend on the reservation being large enough).
 
 use std::alloc::Layout;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::cell::RefCell;
+use std::sync::OnceLock;
 
 pub const BLOCK: usize = 16 << 10;
 const HUGE: usize = 2 << 20;
@@ -21,7 +25,16 @@ pub struct Arena {
     cap: usize,
     map: (usize, usize), // the whole mapping, for munmap
     bump: AtomicUsize,
-    free: Mutex<Vec<usize>>,
+}
+
+struct Local {
+    free: Vec<usize>,
+    cur: usize,
+    end: usize,
+}
+
+thread_local! {
+    static LOCAL: RefCell<Local> = const { RefCell::new(Local { free: Vec::new(), cur: 0, end: 0 }) };
 }
 
 static ARENA: OnceLock<Arena> = OnceLock::new();
@@ -42,18 +55,12 @@ pub fn init(bytes: usize) {
         )
     };
     let a = if p == libc::MAP_FAILED {
-        Arena { base: 0, cap: 0, map: (0, 0), bump: AtomicUsize::new(0), free: Mutex::new(Vec::new()) }
+        Arena { base: 0, cap: 0, map: (0, 0), bump: AtomicUsize::new(0) }
     } else {
         let base = (p as usize).div_ceil(HUGE) * HUGE;
         // SAFETY: advice on our own mapping; failure only means 4 KB pages
         unsafe { libc::madvise(base as *mut libc::c_void, cap, libc::MADV_HUGEPAGE) };
-        Arena {
-            base,
-            cap,
-            map: (p as usize, len),
-            bump: AtomicUsize::new(0),
-            free: Mutex::new(Vec::with_capacity(1 << 16)),
-        }
+        Arena { base, cap, map: (p as usize, len), bump: AtomicUsize::new(0) }
     };
     let _ = ARENA.set(a);
 }
@@ -63,16 +70,30 @@ fn arena() -> &'static Arena {
     ARENA.get().expect("arena::init not called")
 }
 
-/// One 16 KB block, 4 KB aligned: a recycled one if any, else fresh.
+/// One 16 KB block, 4 KB aligned: one this thread recycled if any, else fresh.
 fn get() -> *mut u8 {
-    let a = arena();
-    if let Some(b) = a.free.lock().unwrap().pop() {
-        return b as *mut u8;
-    }
-    let off = a.bump.fetch_add(BLOCK, Ordering::Relaxed);
-    if off + BLOCK <= a.cap {
-        return (a.base + off) as *mut u8;
-    }
+    LOCAL.with(|l| {
+        let mut l = l.borrow_mut();
+        if let Some(b) = l.free.pop() {
+            return b as *mut u8;
+        }
+        if l.cur == l.end {
+            let a = arena();
+            let off = a.bump.fetch_add(HUGE, Ordering::Relaxed);
+            if off + HUGE > a.cap {
+                return heap_block();
+            }
+            l.cur = a.base + off;
+            l.end = l.cur + HUGE;
+        }
+        let b = l.cur;
+        l.cur += BLOCK;
+        b as *mut u8
+    })
+}
+
+#[cold]
+fn heap_block() -> *mut u8 {
     let layout = Layout::from_size_align(BLOCK, 4096).unwrap();
     // SAFETY: non-zero size; the block is never freed (it may be recycled through `free`)
     let p = unsafe { std::alloc::alloc(layout) };
@@ -83,8 +104,7 @@ fn get() -> *mut u8 {
 }
 
 fn put(blocks: impl Iterator<Item = *mut u8>) {
-    let mut f = arena().free.lock().unwrap();
-    f.extend(blocks.map(|b| b as usize));
+    LOCAL.with(|l| l.borrow_mut().free.extend(blocks.map(|b| b as usize)));
 }
 
 /// Returns the address space to the kernel. SAFETY: no block may be used afterwards.

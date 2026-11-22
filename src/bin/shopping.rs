@@ -1893,6 +1893,7 @@ fn run() -> Res<()> {
                     let mut parts: PartBuf<PEv> = PartBuf::new(npart());
                     let mut table: Vec<u64> = Vec::new();
                     let mut table32: Vec<u32> = Vec::new();
+                    let mut emitted: Vec<*mut PEv> = Vec::new();
                     let mut alive: Vec<u64> = Vec::new();
                     let mut base: Vec<u32> = Vec::with_capacity(outs.len());
                     let mut srcs: Vec<&[EvRec]> = Vec::with_capacity(outs.len());
@@ -1926,11 +1927,15 @@ fn run() -> Res<()> {
                         let mask = (1usize << bits) - 1;
                         if n < (1 << 20) - 1 {
                             // 4-byte slots: 12 hash bits below the index bits << 20 | (dense number
-                            // + 1); 0 = empty. Half the table of the 8-byte layout, so it stays in
-                            // L2 when two hyperthreads share it. A tag match finds its record by a
-                            // binary search over the source blocks (duplicates are a few percent).
+                            // + 1); 0 = empty. A tag match finds its record by a binary search over
+                            // the source blocks (duplicates are a few percent). Single pass: the
+                            // current winner of each event_id is emitted at once and its output
+                            // record remembered; a later, better copy retracts it in place (person
+                            // = INVALID, skipped by the resolve stage). Each record is read once.
                             table32.clear();
                             table32.resize(1 << bits, 0);
+                            emitted.clear();
+                            emitted.resize(n, std::ptr::null_mut());
                             let mut g = 0u32;
                             for src in srcs.iter() {
                                 for cur in src.iter() {
@@ -1938,12 +1943,11 @@ fn run() -> Res<()> {
                                     let mixed = k.wrapping_mul(0xD6E8_FEB8_6659_FD93);
                                     let tag = (((mixed << bits) >> 52) as u32) << 20;
                                     let mut h = (mixed >> (64 - bits)) as usize;
-                                    loop {
+                                    let wins = loop {
                                         let sl = table32[h];
                                         if sl == 0 {
                                             table32[h] = tag | (g + 1);
-                                            alive[(g >> 6) as usize] |= 1u64 << (g & 63);
-                                            break;
+                                            break true;
                                         }
                                         if sl & 0xFFF0_0000 == tag {
                                             let og = (sl & 0x000F_FFFF) - 1;
@@ -1953,13 +1957,22 @@ fn run() -> Res<()> {
                                                 // keep the smallest ingest_ts; on a tie, the first seen
                                                 if cur.ingest < r.ingest {
                                                     table32[h] = tag | (g + 1);
-                                                    alive[(og >> 6) as usize] &= !(1u64 << (og & 63));
-                                                    alive[(g >> 6) as usize] |= 1u64 << (g & 63);
+                                                    let e = emitted[og as usize];
+                                                    if !e.is_null() {
+                                                        // SAFETY: e points at a PEv this thread wrote into
+                                                        // `parts`; blocks never move
+                                                        unsafe { (*e).person = INVALID };
+                                                    }
+                                                    break true;
                                                 }
-                                                break;
+                                                break false;
                                             }
                                         }
                                         h = (h + 1) & mask;
+                                    };
+                                    if wins && cur.user != INVALID {
+                                        // person resolved in the next pass (partitioned join)
+                                        emitted[g as usize] = parts.push_ptr(part_of(cur.user), PEv { person: cur.user, ts: cur.ts, pc: cur.pc });
                                     }
                                     g += 1;
                                 }
@@ -2003,16 +2016,16 @@ fn run() -> Res<()> {
                                     }
                                 }
                             }
-                        }
-                        // emit survivors in memory order
-                        let mut g = 0usize;
-                        for src in srcs.iter() {
-                            for r in src.iter() {
-                                if (alive[g >> 6] >> (g & 63)) & 1 != 0 && r.user != INVALID {
-                                    // person resolved in the next pass (partitioned join)
-                                    parts.push(part_of(r.user), PEv { person: r.user, ts: r.ts, pc: r.pc });
+                            // emit survivors in memory order
+                            let mut g = 0usize;
+                            for src in srcs.iter() {
+                                for r in src.iter() {
+                                    if (alive[g >> 6] >> (g & 63)) & 1 != 0 && r.user != INVALID {
+                                        // person resolved in the next pass (partitioned join)
+                                        parts.push(part_of(r.user), PEv { person: r.user, ts: r.ts, pc: r.pc });
+                                    }
+                                    g += 1;
                                 }
-                                g += 1;
                             }
                         }
                         // SAFETY: partition p is consumed; its blocks take later output
@@ -2051,6 +2064,9 @@ fn run() -> Res<()> {
                         let m = &pmap.parts[q];
                         for o in ue_outs.iter() {
                             for e in o.slices(q).flatten() {
+                                if e.person == INVALID {
+                                    continue; // a copy retracted by dedup
+                                }
                                 let person = m.get(&e.person).copied().unwrap_or(e.person);
                                 parts.push(part_of(person), PEv { person, ts: e.ts, pc: e.pc });
                             }

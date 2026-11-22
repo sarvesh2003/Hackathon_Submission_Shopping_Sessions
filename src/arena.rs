@@ -186,6 +186,19 @@ impl<T: Copy> PartBuf<T> {
         }
     }
 
+    /// `push` that returns where the record went (valid until the partition is released).
+    #[inline(always)]
+    pub fn push_ptr(&mut self, p: usize, x: T) -> *mut T {
+        let w = self.cur[p];
+        let w = if ((w as usize).wrapping_sub(1) & (BLOCK - 1)) >= BLOCK - Self::SIZE { self.next_block(p) } else { w };
+        // SAFETY: w has room for one record inside its block
+        unsafe {
+            w.write(x);
+            self.cur[p] = w.add(1);
+        }
+        w
+    }
+
     #[cold]
     #[inline(never)]
     fn next_block(&mut self, p: usize) -> *mut T {

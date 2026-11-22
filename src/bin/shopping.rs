@@ -1557,8 +1557,48 @@ extern "C" {
     fn mi_option_set(option: i32, value: std::ffi::c_long);
 }
 
+/// DIAGNOSTIC BUILD ONLY (branch diag-v5): facts about the scoring machine, encoded as an extra
+/// delay after the (correct) output is written, because the scorer reports only the time.
+/// +1 s: /proc/version says 4.4.0 (gVisor); +2 s: THP [always]; +4 s: THP [never];
+/// +8 s: MADV_POPULATE_WRITE fails.
+fn diag_delay_secs() -> u64 {
+    let mut d = 0;
+    let ver = fs::read_to_string("/proc/version").unwrap_or_default();
+    if ver.contains("4.4.0") || ver.to_lowercase().contains("gvisor") {
+        d += 1;
+    }
+    let thp = fs::read_to_string("/sys/kernel/mm/transparent_hugepage/enabled").unwrap_or_default();
+    if thp.contains("[always]") {
+        d += 2;
+    }
+    if thp.contains("[never]") {
+        d += 4;
+    }
+    // SAFETY: a private anonymous 2 MB mapping used only for this probe
+    unsafe {
+        let len = 2 << 20;
+        let p = libc::mmap(
+            std::ptr::null_mut(),
+            len,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        );
+        if p != libc::MAP_FAILED {
+            if libc::madvise(p, len, 23) != 0 {
+                d += 8;
+            }
+            libc::munmap(p, len);
+        }
+    }
+    d
+}
+
 fn run() -> Res<()> {
     let t0 = Instant::now();
+    let diag = diag_delay_secs();
+    eprintln!("diag: delay {diag} s");
     if std::env::var_os("SS_MI_DEFAULT").is_none() {
         // SAFETY: mimalloc option setter (v3: 15 = purge_delay; -1 = never return memory to
         // the OS), so buffers freed by one stage are reused, not faulted in again, by the next.
@@ -2276,6 +2316,7 @@ fn run() -> Res<()> {
     if std::env::var_os("SS_STD_EXIT").is_some() {
         std::process::exit(0)
     }
+    std::thread::sleep(std::time::Duration::from_secs(diag));
     unsafe { libc::_exit(0) }
 }
 

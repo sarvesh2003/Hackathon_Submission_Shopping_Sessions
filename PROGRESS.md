@@ -2,66 +2,75 @@
 
 Claude updates this after every milestone. The human reads it to see where things stand.
 
-Last updated: Sat Nov 21, evening ET
+Last updated: Sat Nov 21, ~10:45 PM ET
 
 ## Status
 | Milestone | State | Notes |
 | --- | --- | --- |
-| M0 Setup | done | Repo lives in WSL at `~/shopping_sessions` (not /mnt/c), pushed to GitHub. Kit, dev, cross-check, p20m and f60m datasets generated. |
-| M1 Simple Rust reference (first submission) | gate passed except local bench20 time (see notes) | 36/36 fixtures (native and image), dev MATCH (native and image). 20M: 175 s natively on this laptop. |
-| M2 Fast version v1 | gate passed | Image BIN=shopping: fixtures 36/36, dev MATCH, check20 identical, crosscheck 12/12. 6.6 s on p20m in Docker. |
-| M3 Speed | in progress | ~1.2 s native on p20m (from 5-5.7 s for v1). Two external reviews (Fable, Gemini) applied where they measured faster. |
-| M4 Final hardening | not started | README approach section already written. |
+| M0 Setup | done | Repo lives in WSL at `~/shopping_sessions` (not /mnt/c), pushed to GitHub. |
+| M1 Simple Rust reference (first submission) | done | 36/36 fixtures, dev MATCH (native and image). |
+| M2 Fast version v1 | done | |
+| M3 Speed | in progress | v5 data: ~0.78 s end-to-end locally (8 threads); best scorer result 0.952 s (v4 data), 1.04-1.06 s on v5. |
+| M4 Final hardening | not started | check60 still impossible locally (the reference needs more memory than the laptop has). |
+
+## Rules change (organizers, Sat 9:08 PM): v5
+- 1 in 8 user/event/click IDs is a letter + 32 hex characters; IDs pass through a per-seed keyed bijection. Pipeline rules unchanged. kit/ and docs/rules.md updated; all data regenerated (old data in data_v4/, kit_v4/, git-ignored).
+- Every team's best entry is rescored on v5. Final: top 30, interleaved rounds over 3 fresh 60M datasets (9 runs).
+- Our old code interned long IDs behind a global lock: 9-10 s on v5. Fixed in d96850b: unpackable IDs get a 63-bit hashed key (collision probability ~1e-5 per 60M dataset), bytes kept only where needed.
 
 ## Machine
-CPU: Intel Core Ultra 5 225U (12 cores / 14 threads, laptop) | AVX-512: no (AVX2 yes) | docker NCPU: 14 | docker MemTotal: 10.4 GB (WSL capped at 10 GB; laptop has 15.5 GB) | free disk: 815 GB | clean build time: 69 s with fat LTO (builder cache pruned) | Docker limits used: CPUS=8 MEM=8g
+CPU: Intel Core Ultra 5 225U (12 cores / 14 threads, laptop) | AVX-512: no | WSL capped at 10 GB (laptop 15.5 GB) | Docker limits used: CPUS=8 MEM=8g
+- Only time on AC power (battery throttles ~2x). Background Docker containers distort timings badly.
+- Compare builds only with interleaved runs (`~/scratch_bench/e2e.sh ROUNDS DATA name...`: end-to-end best/q1/median).
+- Windows-exe interop inside WSL is broken since the WSL restart: DOCKER_CONFIG=~/.docker-nocreds for builds; pushes go through Windows git.
 
-Notes on local timing:
-- On battery the CPU is about 3x slower (Windows parks WSL on efficiency cores). Only time on AC power.
-- Runs vary about 20%; compare versions with interleaved medians (`scripts/stage_bench.sh DATA 7 BIN`), not single runs.
-- Local Docker is about 2x slower than native here (Docker Desktop bind mount): use native NCPU=8 for speed, Docker for correctness.
-- The 60M reference needs more memory than this laptop has: it ran 1h40m swapping and then froze WSL (WSL had to be restarted at 2:30 PM). check60 has NOT run.
-- After the WSL restart, Windows-exe interop is broken inside WSL (binfmt entry missing), so the Docker and git credential helpers fail. Workarounds: DOCKER_CONFIG=~/.docker-nocreds for builds; pushes go through Windows git. Fix (sudo): `echo ':WSLInterop:M::MZ::/init:PF' | sudo tee /proc/sys/fs/binfmt_misc/register`.
+## Correctness gate (latest: dc4444a, v5 data)
+shopping: unit tests | fixtures 36/36 | dev MATCH | check20 identical | crosscheck 12/12 | check60: not run (no 60M reference possible locally). 60M output passes the rules' self-checks (sessions and revenue equal across tables, assisted >= non-organic, no duplicate keys).
 
-## Correctness gate (latest run)
-reference: ref-fixtures 36/36, ref-dev MATCH, image fixtures 36/36, image dev MATCH
-shopping image (037bec2): fixtures 36/36 | dev: MATCH | check20: identical | crosscheck: 12/12 | check60: not run (see above)
-
-## Local timings (native, NCPU=8, data/p20m, medians of 5-7 runs unless noted)
-| Commit | Change | Time | Peak memory | Notes |
-| --- | --- | --- | --- | --- |
-| bc75a66 | reference (native) | 175 s | 4.4 GB | single run, AC power |
-| bc75a66 | reference image, bench20 (CPUS=8 MEM=8g) | 123 s | under 8g | single run, output MATCH vs native reference |
-| 2ef8cd9 | shopping v1 | 5.0-5.7 s | 4.1 GB | single runs |
-| beb2920 | AVX2 scanner, per-thread partitions, hash dedup | 1.9-2.3 s | ~2.5 GB | |
-| 41b8e4f | + hand-written Parquet, SWAR timestamps, partitioned person join, bucketed grouping | 1.85 s (min 1.53) | | |
-| 71874c0 | + review fixes: buffer sizing, purchase-only category, date cache, single-person bucket sort | 1.13-1.57 s | | minflt ~32k (was ~250k) |
-| 037bec2 | + no zero-fill counting sort, biggest partitions first, SWAR F3 | ~same as 71874c0 | | neutral locally; less work at 60M |
-| 15e88b3+ | + alive-bitset dedup, fat LTO | ~1.20 s | | dedup stage ~190 ms (was 290-470) |
-| 2133c20 | + line-at-a-time splitter (20 vs 40 ns/line) | ~1.2 s | | leaderboard 1.12 s |
-| next | + unmap inputs on a background thread after parsing | wall ~1.34 -> ~1.21 s | | measured OUTSIDE the process: time from our last write to process exit fell from ~160 ms to ~60 ms (kernel teardown of the 1.9 GB of file mappings) |
-| f60m | shopping 4342a0e, 60M | 14.7 s (first run 29 s) | 6.0 GB RSS | laptop swapping; far under the 3-minute cap |
-
-## Tried and rejected (measured, not faster here)
-- Three alternative CSV splitters (branch-free popcount, two-stage index array): 1.4-2.5x slower than the bit-iteration splitter.
-- Person lookup fused into dedup via one global table with batched prefetch (both reviews suggested it): dedup+lookup ~500 ms vs ~255 ms for the partitioned join.
-- Union-find before parsing on all threads: +260 ms on the critical path; overlapping it on worker 0 is better. Union-find without rayon: too slow, delays the parse stage.
-- Freeing the big buffers before writing Parquet: doubles page faults.
-- Bitmap filter in front of the person map; mimalloc purge/large-page options (MIMALLOC_ALLOW_LARGE_OS_PAGES=1: no change in faults); MAP_POPULATE.
-- Freeing dead intermediate buffers on background threads: no gain (exit gap not reduced).
-
-## Measuring note
-- Stage timers stop at our last write; the scorer clock runs until the process (container) exits. Measure wall time outside the process: the gap was ~160 ms (now ~60 ms).
+## What the scorer measures (established with two diagnostic submissions)
+- ade74e6 (delay-encoded facts): real Linux (not gVisor), THP madvise, MADV_POPULATE_WRITE supported.
+- 5649428 (sleep 10x our own running time): ~0.96 s of the 1.04 s score is inside our process; only ~80 ms outside.
+- So the score tracks our 8-thread end-to-end wall time (critical path), not total CPU work. Practice scores also vary ~10-20% across machines, so single submissions cannot resolve <10% differences.
 
 ## Submissions
-| Time (ET) | Commit | Leaderboard result | Notes |
+| Commit | Data | Scorer | Notes |
 | --- | --- | --- | --- |
-| Sat evening | 2133c20 | 1.12 s | practice leaderboard; #1 is 0.29 s |
+| 2133c20 | v4 | 1.12 s | |
+| 8904915 | v4 | 1.08 s | |
+| 19fd217 | v4 | 1.05 s | |
+| f4b00c4 | v4 | 1.05 s | |
+| 3c7c9d7 (exp-pread) | v4 | 1.08 s | pread instead of mmap |
+| 173b98a / ac22c3b | v4 | 0.952 s | arena + lock-free blocks, no second rayon pool, SIMD ID packing |
+| d96850b | v5 | 1.06 s | hashed keys for long IDs |
+| 3537898 | v5 | 1.06 s | name pointers instead of per-thread maps (in-process -15%, but +100 ms exit; since fixed) |
+| ade74e6 | v5 | 1.04 s | diagnostic (delay 0) |
+| 5649428 | v5 | 10.63 s | diagnostic (in-process ~0.96 s) |
+
+## Local end-to-end (v5 20M, NCPU=8, 11 interleaved rounds)
+| Commit | best | median |
+| --- | --- | --- |
+| d96850b | 807 ms | 869 ms |
+| 3537898 | 760 ms | 815 ms |
+| dc4444a | 741 ms | 797 ms |
+
+## Kept since the 0.952 s submission
+- Pre-fault arena slabs (MADV_POPULATE_WRITE), parallel arena zap, `_exit(0)`.
+- Sessions: LSD radix sort by (person bucket, ts); partitions sub-split so the sort stays in half an L2 at 60M.
+- Splitter: one branch for all malformed-line checks. Event type by one integer compare.
+- v5: hashed keys; long-ID names as (key, input pointer) records turned into per-partition maps in the resolve stage; inputs dropped in parallel after the write.
+- Union-find: no byte comparisons in unions; roots in one pass; persons named in one pass (v5 ~300 -> ~175 ms on worker 0; would have neared the parse stage at 60M).
+- PartBuf: one write pointer per partition. Startup: parallel chunking, categories deduplicated before sorting.
+
+## Tried and rejected (measured, not faster here)
+- Splitters: popcount/two-stage index (1.4-2.5x slower); 3-block sliding window with masks once per aligned 64 B (28.6 -> 39.7 ns/line); byte-load quote detection.
+- Branch-free timestamps (64 vs 54 ns/line); dropping one radix pass with a fix-up check (sessions 797 vs 740 ms).
+- Flat open-addressing person maps in resolve (no change: data-movement bound); pre-sized per-thread maps.
+- Person lookup fused into dedup / during parse (DRAM misses); union-find before parsing; two records per event; non-temporal stores; 256/1024/2048 partitions.
+- MADV_POPULATE_READ on input chunks; pre-touching the input; pread input; MAP_POPULATE; mimalloc options; glibc malloc.
 
 ## Open questions and blockers
-- Leaderboard score of our submissions (needed to know the real gap to 0.3 s).
-- Profiling needs: echo 1 | sudo tee /proc/sys/kernel/perf_event_paranoid.
 - check60 needs a machine with more memory, or a lower-memory way to run the reference.
+- Exact (collision-free) long-ID keys would cost ~3-5%; currently hashed (~1e-5 risk per dataset). Human's call.
 
 ## Next step
-- Gemini rank 9 (Parquet columns written directly, INT32 counts), rank 1 (line-at-a-time u128 splitter), rank 7 (PEXT ID packing), rank 2 (write-combining scatter, 24-byte EvRec).
+- Critical-path work (8-thread wall): exit path, sessions per-person work, parse, union-find on worker 0. A fresh design review is running.

@@ -915,29 +915,34 @@ fn map_files(paths: &[PathBuf]) -> Res<Vec<Mmap>> {
         .collect()
 }
 
-/// Splits every file (header line skipped) into chunks of whole lines.
+/// Splits every file (header line skipped) into chunks of whole lines; files in parallel (each
+/// boundary search touches a fresh input page), chunks in file order.
 fn chunk_files(maps: &[Mmap], target: usize) -> Vec<&[u8]> {
-    let mut chunks = Vec::new();
-    for m in maps {
-        let data: &[u8] = m;
-        let mut pos = match memchr::memchr(b'\n', data) {
-            Some(p) => p + 1,
-            None => continue, // header only
-        };
-        let len = data.len();
-        while pos < len {
-            let mut end = (pos + target).min(len);
-            if end < len {
-                end = match memchr::memchr(b'\n', &data[end..]) {
-                    Some(p) => end + p + 1,
-                    None => len,
-                };
+    let per_file: Vec<Vec<&[u8]>> = maps
+        .par_iter()
+        .map(|m| {
+            let data: &[u8] = m;
+            let mut chunks = Vec::new();
+            let mut pos = match memchr::memchr(b'\n', data) {
+                Some(p) => p + 1,
+                None => return chunks, // header only
+            };
+            let len = data.len();
+            while pos < len {
+                let mut end = (pos + target).min(len);
+                if end < len {
+                    end = match memchr::memchr(b'\n', &data[end..]) {
+                        Some(p) => end + p + 1,
+                        None => len,
+                    };
+                }
+                chunks.push(&data[pos..end]);
+                pos = end;
             }
-            chunks.push(&data[pos..end]);
-            pos = end;
-        }
-    }
-    chunks
+            chunks
+        })
+        .collect();
+    per_file.into_iter().flatten().collect()
 }
 
 fn data_lines(buf: &[u8]) -> impl Iterator<Item = &[u8]> {
@@ -1675,10 +1680,11 @@ fn run() -> Res<()> {
             prod_rows.push((f[0], f[1]));
         }
     }
-    let mut cat_names: Vec<&[u8]> = prod_rows.iter().map(|r| r.1).collect();
-    cat_names.push(b"unknown");
+    // distinct categories first (a few dozen), then sort only those
+    let mut seen_cats: std::collections::HashSet<&[u8]> = prod_rows.iter().map(|r| r.1).collect();
+    seen_cats.insert(b"unknown");
+    let mut cat_names: Vec<&[u8]> = seen_cats.into_iter().collect();
     cat_names.sort_unstable();
-    cat_names.dedup();
     if cat_names.len() > 255 {
         return Err("more than 255 categories is not supported".into());
     }

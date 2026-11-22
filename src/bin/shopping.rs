@@ -931,8 +931,8 @@ struct Ctx {
 
 impl Ctx {
     #[inline]
-    fn category(&self, product: &[u8]) -> u8 {
-        match pack(product) {
+    fn category(&self, product: &[u8], end: usize) -> u8 {
+        match pack_at(product, end) {
             Some(k) => self.prod_packed.get(&k).copied().unwrap_or(self.unknown_cat),
             None => self.prod_bytes.get(product).copied().unwrap_or(self.unknown_cat),
         }
@@ -960,13 +960,20 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> EvRec {
         Some(t) if t >= ctx.ws && t < ctx.we => t,
         _ => return rec,
     };
-    let price = match etype {
-        b"view" | b"cart" => 0,
-        b"purchase" => match parse_price(price_raw) {
+    // event type by one integer compare: "view" / "cart" (4 bytes) or "purchase" (8 bytes)
+    let price = if etype.len() == 4 {
+        let w = u32::from_le_bytes([etype[0], etype[1], etype[2], etype[3]]);
+        if w != u32::from_le_bytes(*b"view") && w != u32::from_le_bytes(*b"cart") {
+            return rec;
+        }
+        0
+    } else if etype.len() == 8 && u64::from_le_bytes(etype[..8].try_into().unwrap()) == u64::from_le_bytes(*b"purchase") {
+        match parse_price(price_raw) {
             Some(p) => p,
             None => return rec,
-        },
-        _ => return rec,
+        }
+    } else {
+        return rec;
     };
     if ingest.saturating_sub(ts) > DAY_MS {
         return rec;
@@ -974,7 +981,7 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> EvRec {
     rec.user = id_key_at(user, dc.end);
     rec.ts = (ts - ctx.ws) as u32;
     // the category is only ever read for purchases (price > 0)
-    let cat = if price > 0 { ctx.category(product) } else { 0 };
+    let cat = if price > 0 { ctx.category(product, dc.end) } else { 0 };
     rec.pc = price | ((cat as u32) << 24);
     rec
 }
@@ -2303,7 +2310,7 @@ fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
     });
     run("+ product category", &mut || {
         let mut n = 0usize;
-        for_each_record::<7>(&data, |f| n += ctx.category(f[5]) as usize);
+        for_each_record::<7>(&data, |f| n += ctx.category(f[5], 0) as usize);
         n
     });
     let mut dc = DateCache::new();
@@ -2327,6 +2334,46 @@ fn micro(event_chunks: &[&[u8]], ctx: &Ctx) {
             }
         });
         parts.iter().map(|p| p.len()).sum()
+    });
+    // production splitter, cached dates, 16-byte packing: cumulative field costs
+    let mut dc2 = DateCache::new();
+    dc2.end = dend;
+    run("v5: split", &mut || {
+        let mut n = 0usize;
+        for_each_record_v5::<7>(&data, |f| n += std::hint::black_box(f)[0].len());
+        n
+    });
+    run("v5: + 2 packs", &mut || {
+        let mut n = 0u64;
+        for_each_record_v5::<7>(&data, |f| n = n.wrapping_add(id_key_at(f[0], dend) ^ id_key_at(f[1], dend)));
+        n as usize
+    });
+    run("v5: + 2 packs + ts", &mut || {
+        let mut n = 0u64;
+        for_each_record_v5::<7>(&data, |f| {
+            n = n.wrapping_add(id_key_at(f[0], dend) ^ id_key_at(f[1], dend));
+            n = n.wrapping_add(parse_ts_c(f[2], &mut dc2).unwrap_or(0) as u64);
+        });
+        n as usize
+    });
+    run("v5: + 2 packs + ts + ingest", &mut || {
+        let mut n = 0u64;
+        for_each_record_v5::<7>(&data, |f| {
+            n = n.wrapping_add(id_key_at(f[0], dend) ^ id_key_at(f[1], dend));
+            n = n.wrapping_add(parse_ts_c(f[2], &mut dc2).unwrap_or(0) as u64);
+            n = n.wrapping_add(parse_ts_c(f[3], &mut dc2).unwrap_or(0) as u64);
+        });
+        n as usize
+    });
+    run("v5: full parse_event", &mut || {
+        let mut n = 0u64;
+        for_each_record_v5::<7>(&data, |f| {
+            if !f[0].is_empty() {
+                let r = parse_event(f, ctx, &mut dc2);
+                n = n.wrapping_add(r.eid ^ r.user ^ r.ingest as u64 ^ r.ts as u64 ^ r.pc as u64);
+            }
+        });
+        n as usize
     });
 }
 

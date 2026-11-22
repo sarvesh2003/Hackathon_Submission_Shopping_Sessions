@@ -1081,42 +1081,44 @@ fn parse_click(f: &[&[u8]; 4], ctx: &Ctx, dc: &mut DateCache) -> Option<(u64, u3
 
 // ======================================================================= links
 
-/// Link pairs per chunk, plus (key, `name_ref`) of every unpackable linked ID (the input stays
-/// mapped until the process exits), sorted by key with duplicates removed.
-fn parse_links(link_chunks: &[&[u8]]) -> (Vec<Vec<(u64, u64)>>, Vec<(u64, u64)>) {
-    let res: Vec<(Vec<(u64, u64)>, Dict, Vec<(u64, u64)>)> = link_chunks
-        .par_iter()
-        .map(|chunk| {
-            let mut v = Vec::new();
-            let mut d = Dict::new();
-            let mut refs = Vec::new();
-            for_each_record_v5::<2>(chunk, |f| {
-                if !f[0].is_empty() && !f[1].is_empty() {
-                    let (a, b) = (id_key(f[0]), id_key(f[1]));
-                    for (k, id) in [(a, f[0]), (b, f[1])] {
-                        if k & FALLBACK != 0 {
-                            d.note(k, id);
-                            if let Some(r) = name_ref(id) {
-                                refs.push((k, r));
-                            }
-                        }
-                    }
-                    v.push((a, b));
-                }
-            });
-            (v, d, refs)
-        })
-        .collect();
-    let mut pairs = Vec::with_capacity(res.len());
+/// One chunk of links: its pairs, the bytes of its unpackable IDs (for output names), and
+/// (key, `name_ref`) of those IDs (for union-find; the input stays mapped until the process exits).
+type LinkOut = (Vec<(u64, u64)>, Dict, Vec<(u64, u64)>);
+
+fn parse_link_chunk(chunk: &[u8]) -> LinkOut {
+    let mut v = Vec::new();
+    let mut d = Dict::new();
     let mut refs = Vec::new();
-    let mut dicts = Vec::with_capacity(res.len());
-    for (v, d, r) in res {
+    for_each_record_v5::<2>(chunk, |f| {
+        if !f[0].is_empty() && !f[1].is_empty() {
+            let (a, b) = (id_key(f[0]), id_key(f[1]));
+            for (k, id) in [(a, f[0]), (b, f[1])] {
+                if k & FALLBACK != 0 {
+                    d.note(k, id);
+                    if let Some(r) = name_ref(id) {
+                        refs.push((k, r));
+                    }
+                }
+            }
+            v.push((a, b));
+        }
+    });
+    (v, d, refs)
+}
+
+/// All link chunks' results: pairs per chunk, and the refs sorted by key without duplicates.
+/// The dictionaries go to DICTS (output names).
+fn gather_links(outs: Vec<LinkOut>) -> (Vec<Vec<(u64, u64)>>, Vec<(u64, u64)>) {
+    let mut pairs = Vec::with_capacity(outs.len());
+    let mut refs = Vec::new();
+    let mut dicts = Vec::with_capacity(outs.len());
+    for (v, d, r) in outs {
         pairs.push(v);
         dicts.push(d);
         refs.extend(r);
     }
     DICTS.write().unwrap().extend(dicts);
-    refs.par_sort_unstable_by_key(|r| r.0);
+    refs.sort_unstable_by_key(|r| r.0);
     refs.dedup_by_key(|r| r.0);
     (pairs, refs)
 }
@@ -1759,7 +1761,7 @@ fn run() -> Res<()> {
     let link_maps = map_files(&list_csv(&data_dir.join("links"))?)?;
     let event_maps = map_files(&list_csv(&data_dir.join("events"))?)?;
     let click_maps = map_files(&list_csv(&data_dir.join("clicks"))?)?;
-    let link_chunks = chunk_files(&link_maps, CHUNK_BYTES);
+    let link_chunks = chunk_files(&link_maps, 256 << 10);
     let event_chunks = chunk_files(&event_maps, CHUNK_BYTES);
     let click_chunks = chunk_files(&click_maps, CHUNK_BYTES);
     // Partitions sized for the caches: per-partition tables and sort buffers were tuned at ~2 GB
@@ -1794,32 +1796,32 @@ fn run() -> Res<()> {
         return Ok(());
     }
 
-    // ---- links (parallel parse)
-    let (link_pairs, link_refs) = parse_links(&link_chunks);
-    stage!(t0, "parsed links");
-
-    // ---- worker 0: union-find, then parse; others: events first, clicks once the map exists
+    // ---- one work queue: link chunks first, then events, then clicks. The worker that finishes
+    // the last link chunk runs union-find while the others parse events.
     let gate: Gate<PersonMap> = Gate::new();
     let next = AtomicUsize::new(0);
+    let n_link = link_chunks.len();
+    let link_slots: Vec<Mutex<Option<LinkOut>>> = (0..n_link).map(|_| Mutex::new(None)).collect();
+    let links_done = AtomicUsize::new(0);
+    if n_link == 0 {
+        // no link lines at all (or header-only files): nobody would finish a last link chunk
+        let (pairs, refs) = gather_links(Vec::new());
+        gate.set(build_person_map(&pairs, &refs));
+    }
     let n_ev = event_chunks.len();
-    let n_all = n_ev + click_chunks.len();
+    let n_all = n_link + n_ev + click_chunks.len();
     // address space for all partition buffers: parse output is ~0.35 B per input byte, plus a
     // partly filled block per (thread, partition, kind); untouched reservation costs nothing
     let in_bytes: usize = event_chunks.iter().chain(click_chunks.iter()).map(|c| c.len()).sum();
     arena::set_populate(std::env::var_os("SS_NO_POPULATE").is_none());
     arena::init(in_bytes * 3 / 4 + nthreads * npart() * 4 * arena::BLOCK + (256 << 20));
-    // union-find runs on worker 0 in the global pool: nobody steals its parallel parts until
-    // the other workers run out of chunks, so no second pool oversubscribes the cores
-    let outs: Vec<ParseOut> = rayon::broadcast(|bc| {
-        let w = bc.index();
+    // union-find runs inside the global pool: nobody steals its parallel parts until the other
+    // workers run out of chunks, so no second pool oversubscribes the cores
+    let outs: Vec<ParseOut> = rayon::broadcast(|_bc| {
         {
-                let (gate, next, ctx, link_pairs, link_refs) = (&gate, &next, &ctx, &link_pairs, &link_refs);
-                let (event_chunks, click_chunks) = (&event_chunks, &click_chunks);
+                let (gate, next, ctx, link_slots, links_done) = (&gate, &next, &ctx, &link_slots, &links_done);
+                let (event_chunks, click_chunks, link_chunks) = (&event_chunks, &click_chunks, &link_chunks);
                 (move || {
-                    if w == 0 {
-                        gate.set(build_person_map(link_pairs, link_refs));
-                        stage!(t0, "union-find done");
-                    }
                     let mut out = ParseOut {
                         ev: PartBuf::new(npart()),
                         cl: PartBuf::new(npart()),
@@ -1831,6 +1833,19 @@ fn run() -> Res<()> {
                         if i >= n_all {
                             break;
                         }
+                        if i < n_link {
+                            *link_slots[i].lock().unwrap() = Some(parse_link_chunk(link_chunks[i]));
+                            if links_done.fetch_add(1, AtOrd::AcqRel) + 1 == n_link {
+                                // the last link chunk: every other one is in its slot
+                                let lo: Vec<LinkOut> = link_slots.iter().map(|m| m.lock().unwrap().take().unwrap()).collect();
+                                let (pairs, refs) = gather_links(lo);
+                                stage!(t0, "parsed links");
+                                gate.set(build_person_map(&pairs, &refs));
+                                stage!(t0, "union-find done");
+                            }
+                            continue;
+                        }
+                        let i = i - n_link;
                         if i < n_ev {
                             dc.end = event_chunks[i].as_ptr() as usize + event_chunks[i].len();
                             for_each_record_v5::<7>(event_chunks[i], |f| {

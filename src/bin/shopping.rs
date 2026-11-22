@@ -2123,7 +2123,7 @@ fn run() -> Res<()> {
                         // L2 at any data size); the next `bbits` bits pick a bucket within the
                         // sub-range (~4 events per bucket, so few buckets hold two persons). A
                         // sub-range is radix-sorted by (bucket, ts), so each bucket is in ts order.
-                        let kbits = n_e.div_ceil(16 << 10).next_power_of_two().trailing_zeros();
+                        let kbits = n_e.div_ceil(8 << 10).next_power_of_two().trailing_zeros();
                         let nsub = 1usize << kbits;
                         let per_sub = n_e >> kbits;
                         let bbits = (per_sub / 4).clamp(16, 1 << 14).next_power_of_two().trailing_zeros();

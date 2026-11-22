@@ -27,6 +27,9 @@ use rayon::prelude::*;
 
 #[path = "../pq.rs"]
 mod pq;
+#[path = "../arena.rs"]
+mod arena;
+use arena::PartBuf;
 
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -1347,8 +1350,8 @@ fn new_parts<T>() -> Vec<Vec<T>> {
 
 /// What one parse thread produces.
 struct ParseOut {
-    ev: Vec<Vec<EvRec>>, // by event_id partition
-    cl: Vec<Vec<PCl>>,   // by person partition
+    ev: PartBuf<EvRec>, // by event_id partition
+    cl: PartBuf<PCl>,   // by user partition
 }
 
 /// A one-shot value that threads can wait for.
@@ -1520,14 +1523,12 @@ fn run() -> Res<()> {
     let next = AtomicUsize::new(0);
     let n_ev = event_chunks.len();
     let n_all = n_ev + click_chunks.len();
-    // capacity guesses err high: measured ~77 B per event line and ~47 B per click line; a
-    // reserved-but-untouched tail costs nothing, a doubling costs a copy and fresh page faults
-    let cl_est = click_chunks.iter().map(|c| c.len()).sum::<usize>() / 40 / nthreads / NPART * 5 / 4 + 64;
-    let est = event_chunks.iter().map(|c| c.len()).sum::<usize>() / 64 / nthreads / NPART * 5 / 4 + 64;
-    // union-find runs on worker 0 during parsing; its parallel parts get their own pool so they
-    // do not wait behind the parse workers, which occupy the global pool
-    let uf_pool = rayon::ThreadPoolBuilder::new().num_threads(nthreads).build()?;
-    let uf_pool = &uf_pool;
+    // address space for all partition buffers: parse output is ~0.35 B per input byte, plus a
+    // partly filled block per (thread, partition, kind); untouched reservation costs nothing
+    let in_bytes: usize = event_chunks.iter().chain(click_chunks.iter()).map(|c| c.len()).sum();
+    arena::init(in_bytes * 3 / 4 + nthreads * NPART * 4 * arena::BLOCK + (256 << 20));
+    // union-find runs on worker 0 in the global pool: nobody steals its parallel parts until
+    // the other workers run out of chunks, so no second pool oversubscribes the cores
     let outs: Vec<ParseOut> = rayon::broadcast(|bc| {
         let w = bc.index();
         {
@@ -1535,12 +1536,12 @@ fn run() -> Res<()> {
                 let (event_chunks, click_chunks) = (&event_chunks, &click_chunks);
                 (move || {
                     if w == 0 {
-                        gate.set(uf_pool.install(|| build_person_map(link_pairs)));
+                        gate.set(build_person_map(link_pairs));
                         stage!(t0, "union-find done");
                     }
                     let mut out = ParseOut {
-                        ev: (0..NPART).map(|_| Vec::with_capacity(est)).collect(),
-                        cl: (0..NPART).map(|_| Vec::with_capacity(cl_est)).collect(),
+                        ev: PartBuf::new(NPART),
+                        cl: PartBuf::new(NPART),
                     };
                     let mut dc = DateCache::new();
                     loop {
@@ -1552,14 +1553,14 @@ fn run() -> Res<()> {
                             for_each_record_v5::<7>(event_chunks[i], |f| {
                                 if !f[0].is_empty() {
                                     let r = parse_event(f, ctx, &mut dc);
-                                    out.ev[part_of(r.eid)].push(r);
+                                    out.ev.push(part_of(r.eid), r);
                                 }
                             });
                         } else {
                             // by user partition; the person is resolved later (partitioned join)
                             for_each_record_v5::<4>(click_chunks[i - n_ev], |f| {
                                 if let Some((user, ts, cid, camp)) = parse_click(f, ctx, &mut dc) {
-                                    out.cl[part_of(user)].push(PCl { person: user, cid, ts, camp });
+                                    out.cl.push(part_of(user), PCl { person: user, cid, ts, camp });
                                 }
                             });
                         }
@@ -1582,14 +1583,11 @@ fn run() -> Res<()> {
 
     // ---- dedup events per event_id partition, scatter survivors by person
     let next = AtomicUsize::new(0);
-    let n_ev_recs: usize = outs.iter().map(|o| o.ev.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let pe_est = n_ev_recs / nthreads / NPART * 3 / 2 + 64;
-    let ue_outs: Vec<Vec<Vec<PEv>>> = rayon::broadcast(|_bc| {
+    let ue_outs: Vec<PartBuf<PEv>> = rayon::broadcast(|_bc| {
         {
                 let (next, outs) = (&next, &outs);
                 (move || {
-                    let mut parts: Vec<Vec<PEv>> =
-                        (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
+                    let mut parts: PartBuf<PEv> = PartBuf::new(NPART);
                     let mut table: Vec<u64> = Vec::new();
                     let mut alive: Vec<u64> = Vec::new();
                     let mut base: Vec<u32> = Vec::with_capacity(outs.len());
@@ -1599,38 +1597,40 @@ fn run() -> Res<()> {
                         if p >= NPART {
                             break;
                         }
-                        // records are addressed in place as (source thread << 24 | index)
+                        // records are addressed in place as (source block << 12 | index)
                         srcs.clear();
-                        srcs.extend(outs.iter().map(|o| &o.ev[p][..]));
-                        assert!(srcs.len() <= 255 && srcs.iter().all(|v| v.len() < 1 << 24));
+                        srcs.extend(outs.iter().flat_map(|o| o.ev.slices(p)));
+                        assert!(srcs.len() < 1 << 20 && srcs.iter().all(|v| v.len() <= 1 << 12));
                         let n: usize = srcs.iter().map(|v| v.len()).sum();
                         if n == 0 {
                             continue;
                         }
-                        // a record is addressed as (source thread << 24 | index); its dense number
+                        // a record is addressed as (source block << 12 | index); its dense number
                         // g = base[thread] + index selects its bit in `alive`
-                        let rec = |id: u32| -> &EvRec { &srcs[(id >> 24) as usize][(id & 0xFF_FFFF) as usize] };
+                        let rec = |id: u32| -> &EvRec { &srcs[(id >> 12) as usize][(id & 0xFFF) as usize] };
                         base.clear();
                         let mut acc = 0u32;
                         for v in srcs.iter() {
                             base.push(acc);
                             acc += v.len() as u32;
                         }
-                        let dense = |id: u32| (base[(id >> 24) as usize] + (id & 0xFF_FFFF)) as usize;
+                        let dense = |id: u32| (base[(id >> 12) as usize] + (id & 0xFFF)) as usize;
                         alive.clear();
                         alive.resize(n.div_ceil(64), 0);
-                        let bits = (2 * n).next_power_of_two().trailing_zeros().max(4);
+                        // load factor 1/3..2/3: a 512 KB table at 20M, half a Cascade Lake L2
+                        let bits = (n + n / 2).next_power_of_two().trailing_zeros().max(4);
                         let mask = (1usize << bits) - 1;
-                        // slot = (low 32 bits of event_id) << 32 | id; EMPTY = u64::MAX
+                        // slot = (32 hash bits below the index bits) << 32 | id; EMPTY = u64::MAX
                         const EMPTY: u64 = u64::MAX;
                         table.clear();
                         table.resize(1 << bits, EMPTY);
                         for (t, src) in srcs.iter().enumerate() {
                             for (i, cur) in src.iter().enumerate() {
-                                let id = ((t as u32) << 24) | i as u32;
+                                let id = ((t as u32) << 12) | i as u32;
                                 let k = cur.eid;
-                                let tag = (k as u32 as u64) << 32;
-                                let mut h = (k.wrapping_mul(0xD6E8_FEB8_6659_FD93) >> (64 - bits)) as usize;
+                                let mixed = k.wrapping_mul(0xD6E8_FEB8_6659_FD93);
+                                let tag = (mixed << bits) & 0xFFFF_FFFF_0000_0000;
+                                let mut h = (mixed >> (64 - bits)) as usize;
                                 loop {
                                     let s = table[h];
                                     if s == EMPTY {
@@ -1664,31 +1664,31 @@ fn run() -> Res<()> {
                             for r in src.iter() {
                                 if (alive[g >> 6] >> (g & 63)) & 1 != 0 && r.user != INVALID {
                                     // person resolved in the next pass (partitioned join)
-                                    parts[part_of(r.user)].push(PEv { person: r.user, ts: r.ts, pc: r.pc });
+                                    parts.push(part_of(r.user), PEv { person: r.user, ts: r.ts, pc: r.pc });
                                 }
                                 g += 1;
                             }
+                        }
+                        // SAFETY: partition p is consumed; its blocks take later output
+                        for o in outs.iter() {
+                            unsafe { o.ev.release(p) };
                         }
                     }
                     parts
                 })()
         }
     });
-    let cu_outs: Vec<Vec<Vec<PCl>>> = outs.into_iter().map(|o| o.cl).collect();
+    let cu_outs: Vec<PartBuf<PCl>> = outs.into_iter().map(|o| o.cl).collect();
     stage!(t0, "dedup events");
 
     // ---- resolve persons: user partition q only needs the small map pmap.parts[q]
     let next = AtomicUsize::new(0);
-    let n_cl: usize = cu_outs.iter().map(|o| o.iter().map(|v| v.len()).sum::<usize>()).sum();
-    let pc_est = n_cl / nthreads / NPART * 3 / 2 + 64;
-    let resolved: Vec<(Vec<Vec<PEv>>, Vec<Vec<PCl>>)> = rayon::broadcast(|_bc| {
+    let resolved: Vec<(PartBuf<PEv>, PartBuf<PCl>)> = rayon::broadcast(|_bc| {
         {
                 let (next, ue_outs, cu_outs, pmap) = (&next, &ue_outs, &cu_outs, &pmap);
                 (move || {
-                    let mut parts: Vec<Vec<PEv>> =
-                        (0..NPART).map(|_| Vec::with_capacity(pe_est)).collect();
-                    let mut cparts: Vec<Vec<PCl>> =
-                        (0..NPART).map(|_| Vec::with_capacity(pc_est)).collect();
+                    let mut parts: PartBuf<PEv> = PartBuf::new(NPART);
+                    let mut cparts: PartBuf<PCl> = PartBuf::new(NPART);
                     loop {
                         let q = next.fetch_add(1, AtOrd::Relaxed);
                         if q >= NPART {
@@ -1696,16 +1696,23 @@ fn run() -> Res<()> {
                         }
                         let m = &pmap.parts[q];
                         for o in ue_outs.iter() {
-                            for e in &o[q] {
+                            for e in o.slices(q).flatten() {
                                 let person = m.get(&e.person).copied().unwrap_or(e.person);
-                                parts[part_of(person)].push(PEv { person, ts: e.ts, pc: e.pc });
+                                parts.push(part_of(person), PEv { person, ts: e.ts, pc: e.pc });
                             }
                         }
                         for o in cu_outs.iter() {
-                            for c in &o[q] {
+                            for c in o.slices(q).flatten() {
                                 let person = m.get(&c.person).copied().unwrap_or(c.person);
-                                cparts[part_of(person)].push(PCl { person, ..*c });
+                                cparts.push(part_of(person), PCl { person, ..*c });
                             }
+                        }
+                        // SAFETY: user partition q is consumed, by this thread only
+                        for o in ue_outs.iter() {
+                            unsafe { o.release(q) };
+                        }
+                        for o in cu_outs.iter() {
+                            unsafe { o.release(q) };
                         }
                     }
                     (parts, cparts)
@@ -1714,14 +1721,14 @@ fn run() -> Res<()> {
     });
     drop(ue_outs);
     drop(cu_outs);
-    let (pe_outs, cl_outs): (Vec<Vec<Vec<PEv>>>, Vec<Vec<Vec<PCl>>>) = resolved.into_iter().unzip();
+    let (pe_outs, cl_outs): (Vec<PartBuf<PEv>>, Vec<PartBuf<PCl>>) = resolved.into_iter().unzip();
     stage!(t0, "resolved persons");
 
     // ---- per person partition: sessions, credit, assists
     let ncat = cat_names.len();
     let next = AtomicUsize::new(0);
     let mut order: Vec<(usize, usize)> = (0..NPART)
-        .map(|p| (pe_outs.iter().map(|o| o[p].len()).sum::<usize>(), p))
+        .map(|p| (pe_outs.iter().map(|o| o.len(p)).sum::<usize>(), p))
         .collect();
     order.sort_unstable_by(|a, b| b.cmp(a));
     let order: Vec<usize> = order.into_iter().map(|x| x.1).collect();
@@ -1740,8 +1747,8 @@ fn run() -> Res<()> {
                         }
                         let p = order[i];
                         let ta = Instant::now();
-                        let esrc: Vec<&[PEv]> = pe_outs.iter().map(|o| &o[p][..]).collect();
-                        let csrc: Vec<&[PCl]> = cl_outs.iter().map(|o| &o[p][..]).collect();
+                        let esrc: Vec<&[PEv]> = pe_outs.iter().flat_map(|o| o.slices(p)).collect();
+                        let csrc: Vec<&[PCl]> = cl_outs.iter().flat_map(|o| o.slices(p)).collect();
                         let n_e: usize = esrc.iter().map(|v| v.len()).sum();
                         let tb = Instant::now();
                         // group by person: counting sort into hash buckets (about one person
@@ -1808,6 +1815,15 @@ fn run() -> Res<()> {
         }
     });
     stage!(t0, "sessions");
+    // all partition buffers are dead: return the arena to the kernel off the critical path, so
+    // neither the Parquet writers nor the exit teardown pay for it
+    drop(pe_outs);
+    drop(cl_outs);
+    if std::env::var_os("SS_TIMERS").is_some() {
+        eprintln!("arena: {} MB of fresh blocks", arena::used() >> 20);
+    }
+    // SAFETY: no PartBuf is alive any more
+    std::thread::spawn(|| unsafe { arena::unmap() });
 
     // ---- merge campaign accumulators
     let mut camp_total = vec![CampAcc::default(); (ctx.ncamp + 1) * ndays];

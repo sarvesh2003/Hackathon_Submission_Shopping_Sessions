@@ -205,9 +205,15 @@ fn hash_bytes(s: &[u8]) -> u64 {
         i += 8;
     }
     if i < n {
-        let mut t = [0u8; 8];
-        t[..n - i].copy_from_slice(&s[i..]);
-        let w = u64::from_le_bytes(t);
+        // the tail: the last 8 bytes (overlapping the previous word) when there are 8, so no
+        // variable-length copy; shorter strings are padded with zeros
+        let w = if n >= 8 {
+            u64::from_le_bytes(s[n - 8..n].try_into().unwrap())
+        } else {
+            let mut t = [0u8; 8];
+            t[..n].copy_from_slice(s);
+            u64::from_le_bytes(t)
+        };
         h = fold(h ^ w, 0xE703_7ED1_A0B4_28DB) ^ w.rotate_left(29);
     }
     h ^= h >> 33;
@@ -1125,9 +1131,9 @@ fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> EvRec {
     }
     rec.user = id_key_at(user, dc.end);
     rec.ts = (ts - ctx.ws) as u32;
-    // the category is only ever read for purchases (price > 0)
-    let cat = if price > 0 { ctx.category(product, dc.end) } else { 0 };
-    rec.pc = price | ((cat as u32) << 24);
+    // price > 0 only for a valid purchase; its category (pc bits 24..32) is filled in by the
+    // caller, batched per chunk (see the events loop)
+    rec.pc = price;
     rec
 }
 
@@ -1912,6 +1918,7 @@ fn run() -> Res<()> {
                         names: PartBuf::new(npart()),
                     };
                     let mut dc = DateCache::new();
+                    let mut pend: Vec<(*mut EvRec, &[u8])> = Vec::new();
                     loop {
                         let i = next.fetch_add(1, AtOrd::Relaxed);
                         if i >= n_all {
@@ -1936,9 +1943,20 @@ fn run() -> Res<()> {
                                 if !f[0].is_empty() {
                                     let r = parse_event(f, ctx, &mut dc);
                                     note_name(&mut out.names, r.user, f[1]);
-                                    out.ev.push(part_of(r.eid), r);
+                                    let w = out.ev.push_ptr(part_of(r.eid), r);
+                                    if r.pc != 0 {
+                                        pend.push((w, f[5]));
+                                    }
                                 }
                             });
+                            // Product categories of this chunk's purchases (a few percent of the
+                            // events), looked up together: the lookups are independent, so their
+                            // cache misses overlap instead of stalling the parse once each.
+                            for (w, product) in pend.drain(..) {
+                                let cat = ctx.category(product, dc.end) as u32;
+                                // SAFETY: w is a record this thread wrote into out.ev; blocks never move
+                                unsafe { (*w).pc |= cat << 24 };
+                            }
                         } else {
                             // by user partition; the person is resolved later (partitioned join)
                             let ch = click_chunks[i - n_ev];

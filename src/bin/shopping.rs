@@ -549,22 +549,20 @@ fn for_each_record_v5<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&
         };
         let ls = pos;
         pos += nl + 1;
-        if nl == 0 || c.count_ones() != (N - 1) as u32 {
-            continue; // empty line or wrong field count
-        }
         let term = c | (1u128 << nl); // one past the end of every field
         let starts = 1u128 | (c << 1); // first byte of every field
         let ends = term >> 1; // last byte of every non-empty field
         let open_q = q & starts;
-        if q != 0 {
-            let close_q = q & ends;
-            if q != (open_q | close_q)
-                || (open_q & close_q) != 0
-                || open_q.count_ones() != close_q.count_ones()
-                || (close_q.wrapping_sub(open_q) & term) != 0
-            {
-                continue;
-            }
+        let close_q = q & ends;
+        // every check at once with non-short-circuit `|`: one branch per line, not one per check
+        // (an empty line has no comma, so it fails the field count)
+        let bad = (c.count_ones() != (N - 1) as u32)
+            | (q != (open_q | close_q))
+            | ((open_q & close_q) != 0)
+            | (open_q.count_ones() != close_q.count_ones())
+            | ((close_q.wrapping_sub(open_q) & term) != 0);
+        if bad {
+            continue; // empty line, wrong field count or misplaced quotes
         }
         let line = &chunk[ls..ls + nl];
         let mut cm = c;
@@ -1893,6 +1891,8 @@ fn run() -> Res<()> {
                     let mut w = Worker::new(ctx, ncat);
                     let (mut evs2, mut cls2): (Vec<PEv>, Vec<PCl>) = (Vec::new(), Vec::new());
                     let mut evs3: Vec<PEv> = Vec::new();
+                    let mut evs_pre: Vec<PEv> = Vec::new();
+                    let mut soff: Vec<u32> = Vec::new();
                     let (mut eoff, mut coff): (Vec<u32>, Vec<u32>) = (Vec::new(), Vec::new());
                     let (mut tg, mut tso, mut tp) = (0u64, 0u64, 0u64);
                     loop {
@@ -1906,57 +1906,77 @@ fn run() -> Res<()> {
                         let csrc: Vec<&[PCl]> = cl_outs.iter().flat_map(|o| o.slices(p)).collect();
                         let n_e: usize = esrc.iter().map(|v| v.len()).sum();
                         let tb = Instant::now();
-                        // group by person: counting sort into hash buckets (about one person
-                        // each), then sort each small bucket by (person, ts)
-                        let bbits = (n_e / 16).clamp(16, 1 << 12).next_power_of_two().trailing_zeros();
+                        // Group by person. The person hash's top `kbits` bits split the partition
+                        // into sub-ranges of ~16K events (a sub-range's sort stays inside half an
+                        // L2 at any data size); the next `bbits` bits pick a bucket within the
+                        // sub-range (~4 events per bucket, so few buckets hold two persons). A
+                        // sub-range is radix-sorted by (bucket, ts), so each bucket is in ts order.
+                        let kbits = n_e.div_ceil(16 << 10).next_power_of_two().trailing_zeros();
+                        let nsub = 1usize << kbits;
+                        let per_sub = n_e >> kbits;
+                        let bbits = (per_sub / 4).clamp(16, 1 << 14).next_power_of_two().trailing_zeros();
                         let nb = 1usize << bbits;
-                        let bucket = |k: u64| (k.wrapping_mul(0xA24B_AED4_963E_E407) >> (64 - bbits)) as usize;
-                        sort_by_bucket_ts(&esrc, &mut evs2, &mut evs3, &mut eoff, nb, bucket);
-                        counting_sort(&csrc, &mut cls2, &mut coff, nb, |c| bucket(c.person));
+                        let gbits = kbits + bbits;
+                        let hp = |k: u64| k.wrapping_mul(0xA24B_AED4_963E_E407);
+                        let gbucket = |k: u64| (hp(k) >> (64 - gbits)) as usize;
+                        let sub_of = |k: u64| (hp(k) >> (64 - gbits)) as usize >> bbits;
+                        let local = |k: u64| (hp(k) >> (64 - gbits)) as usize & (nb - 1);
+                        counting_sort(&esrc, &mut evs_pre, &mut soff, nsub, |e| sub_of(e.person));
+                        counting_sort(&csrc, &mut cls2, &mut coff, nsub * nb, |c| gbucket(c.person));
                         let tc = Instant::now();
                         tg += (tb - ta).as_nanos() as u64;
                         tso += (tc - tb).as_nanos() as u64;
-                        for b in 0..nb {
-                            let es = &mut evs2[eoff[b] as usize..eoff[b + 1] as usize];
-                            if es.is_empty() {
+                        for sb in 0..nsub {
+                            let part = &evs_pre[soff[sb] as usize..soff[sb + 1] as usize];
+                            if part.is_empty() {
                                 continue;
                             }
-                            if es.len() > 1 {
-                                // the bucket is already in ts order; when it holds several persons,
-                                // a stable sort by person keeps each person's events in ts order
-                                let p0 = es[0].person;
-                                if !es.iter().all(|e| e.person == p0) {
-                                    es.sort_by_key(|e| e.person);
+                            sort_by_bucket_ts(&[part], &mut evs2, &mut evs3, &mut eoff, nb, local);
+                            // visit only the non-empty buckets, in order, by walking the array
+                            let mut at = 0usize;
+                            while at < evs2.len() {
+                                let b = local(evs2[at].person);
+                                let end = eoff[b + 1] as usize;
+                                let es = &mut evs2[at..end];
+                                at = end;
+                                if es.len() > 1 {
+                                    // the bucket is in ts order; when it holds several persons, a
+                                    // stable sort by person keeps each person's events in ts order
+                                    let p0 = es[0].person;
+                                    if !es.iter().all(|e| e.person == p0) {
+                                        es.sort_by_key(|e| e.person);
+                                    }
                                 }
-                            }
-                            let cs = &mut cls2[coff[b] as usize..coff[b + 1] as usize];
-                            if cs.len() > 1 {
-                                let p0 = cs[0].person;
-                                if cs.iter().all(|c| c.person == p0) {
-                                    cs.sort_unstable_by_key(|c| c.ts);
-                                } else {
-                                    cs.sort_unstable_by_key(|c| ((c.person as u128) << 32) | c.ts as u128);
+                                let g = sb * nb + b;
+                                let cs = &mut cls2[coff[g] as usize..coff[g + 1] as usize];
+                                if cs.len() > 1 {
+                                    let p0 = cs[0].person;
+                                    if cs.iter().all(|c| c.person == p0) {
+                                        cs.sort_unstable_by_key(|c| c.ts);
+                                    } else {
+                                        cs.sort_unstable_by_key(|c| ((c.person as u128) << 32) | c.ts as u128);
+                                    }
                                 }
-                            }
-                            let (es, cs) = (&*es, &*cs);
-                            let mut ci = 0usize;
-                            let mut i = 0usize;
-                            while i < es.len() {
-                                let person = es[i].person;
-                                let mut j = i + 1;
-                                while j < es.len() && es[j].person == person {
-                                    j += 1;
+                                let (es, cs) = (&*es, &*cs);
+                                let mut ci = 0usize;
+                                let mut i = 0usize;
+                                while i < es.len() {
+                                    let person = es[i].person;
+                                    let mut j = i + 1;
+                                    while j < es.len() && es[j].person == person {
+                                        j += 1;
+                                    }
+                                    while ci < cs.len() && cs[ci].person < person {
+                                        ci += 1;
+                                    }
+                                    let mut cj = ci;
+                                    while cj < cs.len() && cs[cj].person == person {
+                                        cj += 1;
+                                    }
+                                    w.person(person, &es[i..j], &cs[ci..cj]);
+                                    ci = cj;
+                                    i = j;
                                 }
-                                while ci < cs.len() && cs[ci].person < person {
-                                    ci += 1;
-                                }
-                                let mut cj = ci;
-                                while cj < cs.len() && cs[cj].person == person {
-                                    cj += 1;
-                                }
-                                w.person(person, &es[i..j], &cs[ci..cj]);
-                                ci = cj;
-                                i = j;
                             }
                         }
                         tp += tc.elapsed().as_nanos() as u64;

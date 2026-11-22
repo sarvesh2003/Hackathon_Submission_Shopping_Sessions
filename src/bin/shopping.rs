@@ -244,24 +244,24 @@ unsafe fn pack16(p: *const u8, len: usize) -> Option<u64> {
     }
     let keep = _mm_loadu_si128(LEN_MASK.as_ptr().add(16 - len) as *const __m128i);
     let x = _mm_and_si128(_mm_loadu_si128(p as *const __m128i), keep);
-    // signed compares are exact here: every bound is below 0x80 and bytes >= 0x80 are negative
-    let rng = |lo: u8, hi: u8| {
-        _mm_and_si128(
-            _mm_cmpgt_epi8(x, _mm_set1_epi8(lo as i8 - 1)),
-            _mm_cmpgt_epi8(_mm_set1_epi8(hi as i8 + 1), x),
-        )
-    };
-    let (d, u, l) = (rng(b'0', b'9'), rng(b'A', b'Z'), rng(b'a', b'z'));
-    let us = _mm_cmpeq_epi8(x, _mm_set1_epi8(b'_' as i8));
-    let valid = _mm_or_si128(_mm_or_si128(d, u), _mm_or_si128(us, l));
-    if _mm_movemask_epi8(_mm_andnot_si128(valid, keep)) != 0 {
+    // Validation by nibble tables: each class of valid byte gets one bit, set in the table of
+    // its high nibble and in the table of every low nibble it allows; a byte is valid iff the
+    // two lookups share a bit. Classes: 1 '0'-'9', 2 'A'-'O', 4 'P'-'Z', 8 '_', 16 'a'-'o',
+    // 32 'p'-'z'. Bytes >= 0x80 have high nibble 8..F (no bits).
+    let hi = _mm_and_si128(_mm_srli_epi16::<4>(x), _mm_set1_epi8(0x0F));
+    let lo = _mm_and_si128(x, _mm_set1_epi8(0x0F));
+    let hi_tab = _mm_setr_epi8(0, 0, 0, 1, 2, 4 | 8, 16, 32, 0, 0, 0, 0, 0, 0, 0, 0);
+    const A: i8 = 1 | 2 | 4 | 16 | 32;
+    let lo_tab = _mm_setr_epi8(1 | 4 | 32, A, A, A, A, A, A, A, A, A, 2 | 4 | 16 | 32, 2 | 16, 2 | 16, 2 | 16, 2 | 16, 2 | 8 | 16);
+    let cls = _mm_and_si128(_mm_shuffle_epi8(hi_tab, hi), _mm_shuffle_epi8(lo_tab, lo));
+    if _mm_movemask_epi8(_mm_and_si128(_mm_cmpeq_epi8(cls, _mm_setzero_si128()), keep)) != 0 {
         return None;
     }
-    // code = byte - offset: '0'..'9' -> 1..10, 'A'..'Z' -> 11..36, '_' -> 37, 'a'..'z' -> 38..63
-    let off = _mm_or_si128(
-        _mm_or_si128(_mm_and_si128(d, _mm_set1_epi8(0x2F)), _mm_and_si128(u, _mm_set1_epi8(0x36))),
-        _mm_or_si128(_mm_and_si128(us, _mm_set1_epi8(0x3A)), _mm_and_si128(l, _mm_set1_epi8(0x3B))),
-    );
+    // code = byte - offset: '0'..'9' -> 1..10, 'A'..'Z' -> 11..36, '_' -> 37, 'a'..'z' -> 38..63;
+    // the offset follows the high nibble, except '_' (0x5F: 0x36 + 4); past the end x = 0 -> 0
+    let off_tab = _mm_setr_epi8(0, 0, 0, 0x2F, 0x36, 0x36, 0x3B, 0x3B, 0, 0, 0, 0, 0, 0, 0, 0);
+    let us = _mm_and_si128(_mm_cmpeq_epi8(x, _mm_set1_epi8(b'_' as i8)), _mm_set1_epi8(4));
+    let off = _mm_add_epi8(_mm_shuffle_epi8(off_tab, hi), us);
     let c = _mm_sub_epi8(x, off); // 0 past the end
     let w = _mm_maddubs_epi16(c, _mm_set1_epi16(0x0140)); // c[2i] * 64 + c[2i+1]
     let v = _mm_madd_epi16(w, _mm_set1_epi32(0x0001_1000)); // 4 codes per 32-bit lane
@@ -640,6 +640,13 @@ fn for_each_record_v5<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&
             continue; // empty line, wrong field count or misplaced quotes
         }
         let line = &chunk[ls..ls + nl];
+        // bit k of qf: field k is quoted (pext gathers the open-quote bits at the field starts)
+        // SAFETY: BMI2 is part of the x86-64-v3 target every build uses
+        let qf = unsafe {
+            use std::arch::x86_64::_pext_u64;
+            let (s_lo, s_hi) = (starts as u64, (starts >> 64) as u64);
+            _pext_u64(open_q as u64, s_lo) | (_pext_u64((open_q >> 64) as u64, s_hi) << s_lo.count_ones())
+        };
         let mut cm = c;
         let mut s = 0usize;
         for (k, slot) in fields.iter_mut().enumerate() {
@@ -650,8 +657,10 @@ fn for_each_record_v5<'a, const N: usize>(chunk: &'a [u8], mut f: impl FnMut(&[&
             } else {
                 nl
             };
-            let qk = ((open_q >> s) & 1) as usize;
-            *slot = &line[s + qk..e - qk];
+            let qk = ((qf >> k) & 1) as usize;
+            // SAFETY: s <= e <= nl (field bounds from the comma mask), and a quoted field has its
+            // closing quote at e - 1 > s (checked above), so s + qk <= e - qk
+            *slot = unsafe { std::slice::from_raw_parts(line.as_ptr().add(s + qk), e - s - 2 * qk) };
             s = e + 1;
         }
         f(&fields);
@@ -3029,6 +3038,16 @@ mod tests {
             rng
         };
         let alphabet: &[u8] = b"0189AZaz_ \t\"\x00\xff-/:@[`{";
+        // every single byte, alone and inside an ID, at every position class
+        for b in 0..=255u8 {
+            for v in [vec![b], vec![b, b'a'], vec![b'a', b], vec![b'Z', b, b'0', b'_', b'z', b'9', b'A', b'm', b]] {
+                let mut buf = v.clone();
+                buf.extend([0x5Fu8; 16]);
+                assert_eq!(pack(&v), pack_scalar(&v), "{:?}", v);
+                // SAFETY: buf has v.len() + 16 bytes
+                assert_eq!(unsafe { pack16(buf.as_ptr(), v.len()) }, pack_scalar(&v), "{:?}", v);
+            }
+        }
         for _ in 0..2_000_000 {
             let n = (next() % 13) as usize;
             let v: Vec<u8> = (0..n)

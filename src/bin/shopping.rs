@@ -1024,11 +1024,27 @@ impl Ctx {
     }
 }
 
+/// `ingest_ts`, which the rules guarantee is a valid F1 (`YYYY-MM-DDTHH:MM:SSZ`): the date goes
+/// through the validated-date cache (a miss validates it in full); the time is read without
+/// re-checking separators or ranges. Any other length takes the general parser.
+#[inline(always)]
+fn parse_ingest(s: &[u8], dc: &mut DateCache) -> i64 {
+    if s.len() == 20 {
+        if let Some(days) = date_days(s, dc) {
+            let dt = le64(s, 11) ^ 0x3030_3030_3030_3030;
+            let by = |i: u32| ((dt >> (8 * i)) & 0xFF) as i64;
+            let secs = (by(0) * 10 + by(1)) * 3600 + (by(3) * 10 + by(4)) * 60 + by(6) * 10 + by(7);
+            return (days * 86_400 + secs) * 1000;
+        }
+    }
+    parse_ts_c(s, dc).unwrap_or(i64::MAX)
+}
+
 /// Fields already split; event_id is non-empty.
 #[inline(always)]
 fn parse_event(f: &[&[u8]; 7], ctx: &Ctx, dc: &mut DateCache) -> EvRec {
     let eid = id_key_at(f[0], dc.end);
-    let ingest = parse_ts_c(f[3], dc).unwrap_or(i64::MAX);
+    let ingest = parse_ingest(f[3], dc);
     let mut rec = EvRec { eid, user: INVALID, ingest, ts: 0, pc: 0 };
     let (user, ts_raw, etype, product, price_raw) = (f[1], f[2], f[4], f[5], f[6]);
     if user.is_empty() || product.is_empty() {

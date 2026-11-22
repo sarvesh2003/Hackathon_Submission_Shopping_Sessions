@@ -2,7 +2,7 @@
 
 Claude updates this after every milestone. The human reads it to see where things stand.
 
-Last updated: Sat Nov 21, ~10:45 PM ET
+Last updated: Sun Nov 22, ~2:40 AM ET
 
 ## Status
 | Milestone | State | Notes |
@@ -10,67 +10,68 @@ Last updated: Sat Nov 21, ~10:45 PM ET
 | M0 Setup | done | Repo lives in WSL at `~/shopping_sessions` (not /mnt/c), pushed to GitHub. |
 | M1 Simple Rust reference (first submission) | done | 36/36 fixtures, dev MATCH (native and image). |
 | M2 Fast version v1 | done | |
-| M3 Speed | in progress | v5 data: ~0.78 s end-to-end locally (8 threads); best scorer result 0.952 s (v4 data), 1.04-1.06 s on v5. |
-| M4 Final hardening | not started | check60 still impossible locally (the reference needs more memory than the laptop has). |
+| M3 Speed | in progress | main 18a8047: ~570 ms in-process locally (8 threads, stage medians); best v5 scorer result 1.0029 s (579f8db). Leaders ~0.55 s. |
+| M4 Final hardening | not started | No new optimizations after 8:00 AM; final SHA confirmed by 10:00 AM. check60 impossible locally. |
 
 ## Rules change (organizers, Sat 9:08 PM): v5
 - 1 in 8 user/event/click IDs is a letter + 32 hex characters; IDs pass through a per-seed keyed bijection. Pipeline rules unchanged. kit/ and docs/rules.md updated; all data regenerated (old data in data_v4/, kit_v4/, git-ignored).
 - Every team's best entry is rescored on v5. Final: top 30, interleaved rounds over 3 fresh 60M datasets (9 runs).
-- Our old code interned long IDs behind a global lock: 9-10 s on v5. Fixed in d96850b: unpackable IDs get a 63-bit hashed key (collision probability ~1e-5 per 60M dataset), bytes kept only where needed.
+- Unpackable IDs get a 63-bit hashed key (collision probability ~1e-5 per 60M dataset), bytes kept only where needed.
 
 ## Machine
 CPU: Intel Core Ultra 5 225U (12 cores / 14 threads, laptop) | AVX-512: no | WSL capped at 10 GB (laptop 15.5 GB) | Docker limits used: CPUS=8 MEM=8g
-- Only time on AC power (battery throttles ~2x). Background Docker containers distort timings badly.
-- Compare builds only with interleaved runs (`~/scratch_bench/e2e.sh ROUNDS DATA name...`: end-to-end best/q1/median).
-- Windows-exe interop inside WSL is broken since the WSL restart: DOCKER_CONFIG=~/.docker-nocreds for builds; pushes go through Windows git.
+- Only time on AC power. The Windows host adds heavy noise (same binary: end-to-end median 640-820 ms between runs).
+- Compare builds with interleaved runs and per-stage times: `~/scratch_bench/stages.sh ROUNDS NCPU DATA name...` (stage min/median; more stable than end-to-end), `e2e2.sh` (wall + CPU seconds).
+- Windows-exe interop inside WSL is broken: DOCKER_CONFIG=~/.docker-nocreds for builds; pushes go through Windows git (`git -c safe.directory='*' push` on the \\wsl.localhost path).
+- 40M runs swap/compact on this laptop (6.6 GB RSS of 9.9 GB): 40M/60M timing is not meaningful here.
 
-## Correctness gate (latest: dc4444a, v5 data)
-shopping: unit tests | fixtures 36/36 | dev MATCH | check20 identical | crosscheck 12/12 | check60: not run (no 60M reference possible locally). 60M output passes the rules' self-checks (sessions and revenue equal across tables, assisted >= non-organic, no duplicate keys).
+## Correctness gate (latest: 18a8047, v5 data)
+shopping: unit tests | fixtures 36/36 | dev MATCH | check20 identical | crosscheck 12/12 | check60: not run (no 60M reference possible locally).
 
 ## What the scorer measures (established with two diagnostic submissions)
 - ade74e6 (delay-encoded facts): real Linux (not gVisor), THP madvise, MADV_POPULATE_WRITE supported.
 - 5649428 (sleep 10x our own running time): ~0.96 s of the 1.04 s score is inside our process; only ~80 ms outside.
-- So the score tracks our 8-thread end-to-end wall time (critical path), not total CPU work. Practice scores also vary ~10-20% across machines, so single submissions cannot resolve <10% differences.
+- So the score tracks our 8-thread end-to-end wall time. Practice scores vary ~10-20% across machines.
 
 ## Submissions
 | Commit | Data | Scorer | Notes |
 | --- | --- | --- | --- |
-| 2133c20 | v4 | 1.12 s | |
-| 8904915 | v4 | 1.08 s | |
-| 19fd217 | v4 | 1.05 s | |
-| f4b00c4 | v4 | 1.05 s | |
-| 3c7c9d7 (exp-pread) | v4 | 1.08 s | pread instead of mmap |
-| 173b98a / ac22c3b | v4 | 0.952 s | arena + lock-free blocks, no second rayon pool, SIMD ID packing |
+| 173b98a / ac22c3b | v4 | 0.952 s | arena + lock-free blocks, SIMD ID packing |
 | d96850b | v5 | 1.06 s | hashed keys for long IDs |
-| 3537898 | v5 | 1.06 s | name pointers instead of per-thread maps (in-process -15%, but +100 ms exit; since fixed) |
-| ade74e6 | v5 | 1.04 s | diagnostic (delay 0) |
-| 5649428 | v5 | 10.63 s | diagnostic (in-process ~0.96 s) |
+| 3537898 | v5 | 1.06 s | name pointers |
+| ade74e6 / 5649428 | v5 | 1.04 / 10.63 s | diagnostics |
+| 3682be7 | v5 | 1.0222 s | 49th at the time |
+| 579f8db | v5 | 1.0029 s | links in parse queue, single-pass dedup, trusted ingest |
 
-## Local end-to-end (v5 20M, NCPU=8, 11 interleaved rounds)
-| Commit | best | median |
-| --- | --- | --- |
-| d96850b | 807 ms | 869 ms |
-| 3537898 | 760 ms | 815 ms |
-| dc4444a | 741 ms | 797 ms |
+## Local stage medians (v5 20M, NCPU=8, ms)
+| Commit | parse | dedup | resolve | sessions | write | in-process |
+| --- | --- | --- | --- | --- | --- | --- |
+| a7d65bd | 382 | 72 | 58 | 144 | 29 | ~690 |
+| 60845a7 | 361 | 74 | 59 | 141 | 30 | ~670 |
+| 18a8047 | 298-309 | 63 | 51 | 119 | 28 | ~570 |
 
-## Kept since the 0.952 s submission
-- Pre-fault arena slabs (MADV_POPULATE_WRITE), parallel arena zap, `_exit(0)`.
-- Sessions: LSD radix sort by (person bucket, ts); partitions sub-split so the sort stays in half an L2 at 60M.
-- Splitter: one branch for all malformed-line checks. Event type by one integer compare.
-- v5: hashed keys; long-ID names as (key, input pointer) records turned into per-partition maps in the resolve stage; inputs dropped in parallel after the write.
-- Union-find: no byte comparisons in unions; roots in one pass; persons named in one pass (v5 ~300 -> ~175 ms on worker 0; would have neared the parse stage at 60M).
-- PartBuf: one write pointer per partition. Startup: parallel chunking, categories deduplicated before sorting.
+## Kept tonight (since 579f8db)
+- a7d65bd: splitter prefetches the input 4 KB ahead (hardware prefetcher stops at each 4 KB page of the mapped files): -7% end-to-end.
+- 8eefdff: products/campaigns tables built while the inputs are mapped (startup 16 -> 8.5 ms); user_id decoded branch-free (pdep + SSE) straight into Parquet PLAIN.
+- 60845a7: purchase categories looked up in one batch per chunk; long-ID hash tail without a variable-length copy.
+- ea8bb54: splitter quote flags by one pext, field slices without bounds checks; pack16 by nibble-table pshufb (split 17.6 -> 15.0 ns/line).
+- 18a8047: name records in 64 partitions (fewer parse write streams); union-find with plain loops, exact capacities, radix sort.
 
 ## Tried and rejected (measured, not faster here)
-- Splitters: popcount/two-stage index (1.4-2.5x slower); 3-block sliding window with masks once per aligned 64 B (28.6 -> 39.7 ns/line); byte-load quote detection.
-- Branch-free timestamps (64 vs 54 ns/line); dropping one radix pass with a fix-up check (sessions 797 vs 740 ms).
-- Flat open-addressing person maps in resolve (no change: data-movement bound); pre-sized per-thread maps.
-- Person lookup fused into dedup / during parse (DRAM misses); union-find before parsing; two records per event; non-temporal stores; 256/1024/2048 partitions.
-- MADV_POPULATE_READ on input chunks; pre-touching the input; pread input; MAP_POPULATE; mimalloc options; glibc malloc.
+- Splitters: popcount/two-stage index; 3-block sliding window; byte-load quote detection.
+- Branch-free timestamps; dropping one radix pass; sessions insertion sort per bucket instead of the radix (persons 545 -> 625 ms single-thread); 10-bit or 8-bit radix digits.
+- Flat open-addressing person maps in resolve (re-measured tonight per stage: no change).
+- Linked-user bitset so dedup writes unlinked users' events straight to person partitions: resolve 53 -> 28 ms but dedup 63 -> 95 ms (two output buffers = twice the write streams).
+- Prefetching inside dedup/resolve/sessions block reads; write-side prefetch in the parse scatter.
+- Person lookup fused into dedup / during parse; union-find before parsing; two records per event; non-temporal stores; 256/1024/2048 partitions.
+- MADV_POPULATE_READ on input chunks; pre-touching the input; pread input; MAP_POPULATE; mimalloc options (re-checked tonight); glibc malloc.
+
+## Where the time goes (single-thread CPU, 20M)
+parse ~1.45 s (splitter ~15 ns/line, packing ~8, timestamps ~11), sessions ~0.66 s (counting sorts 0.14, radix 0.19, per-person 0.33), dedup ~0.26 s, resolve ~0.29 s, write ~0.15 s, kernel page zeroing for the ~1 GB arena 0.2-0.4 s (heavier here than on a machine with free hugepages).
 
 ## Open questions and blockers
 - check60 needs a machine with more memory, or a lower-memory way to run the reference.
 - Exact (collision-free) long-ID keys would cost ~3-5%; currently hashed (~1e-5 risk per dataset). Human's call.
 
 ## Next step
-- Critical-path work (8-thread wall): exit path, sessions per-person work, parse, union-find on worker 0. A fresh design review is running.
+- Keep cutting parse (still ~52% of wall) and sessions; gate and push each measured win; freeze at 8:00 AM.
